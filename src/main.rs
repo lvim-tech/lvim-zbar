@@ -5,7 +5,8 @@
 // bar whose colours are baked into the layout at session start.
 //
 // Layout:
-//   left  : mode pill · session pill · tabs
+//   left  : mode pill · session pill · tabs · transient NOTICE (pipe "notice", payload = text —
+//           any plugin broadcast or `zellij pipe -n notice -- "text"`; fades after ~6s)
 //   right : CPU · MEM · online · clock
 // CPU/MEM/online/clock come from helper scripts run via the RunCommands
 // permission (like zjstatus command widgets), refreshed on a timer.
@@ -51,7 +52,17 @@ struct State {
     // instance keeps a mirror of the buffer; the key-owning instance is the
     // one whose edits are authoritative (it broadcasts them here).
     session_edit: Option<String>,
+    // A transient system NOTICE shown next to the tabs — anything can put one
+    // there with a pipe named "notice" (payload = the text): another plugin's
+    // broadcast (lvim-zsession pipes "session saved") or the CLI
+    // (`zellij pipe -n notice -- "text"`). Cleared after NOTICE_TICKS timer
+    // ticks; a new notice simply replaces the old one.
+    notice: Option<String>,
+    notice_ticks: u8,
 }
+
+/// How many TICK periods a notice stays on the bar (TICK = 2s → ~6 seconds).
+const NOTICE_TICKS: u8 = 3;
 
 register_plugin!(State);
 
@@ -115,6 +126,14 @@ impl ZellijPlugin for State {
             }
             Event::Timer(_) => {
                 self.sample();
+                // Age the notice out: repaint only on the tick that clears it.
+                if self.notice_ticks > 0 {
+                    self.notice_ticks -= 1;
+                    if self.notice_ticks == 0 {
+                        self.notice = None;
+                        return true;
+                    }
+                }
                 false
             }
             Event::RunCommandResult(_code, stdout, _stderr, ctx) => {
@@ -175,6 +194,22 @@ impl ZellijPlugin for State {
                     self.mode_info.session_name = Some(applied);
                 }
                 self.session_edit.take().is_some()
+            }
+            // A transient system notice for the zone next to the tabs. Generic on
+            // purpose: any plugin broadcast or `zellij pipe -n notice -- "text"`
+            // lands here. Empty payload clears an existing notice early.
+            "notice" => {
+                match message.payload.filter(|p| !p.trim().is_empty()) {
+                    Some(text) => {
+                        self.notice = Some(text.trim().to_string());
+                        self.notice_ticks = NOTICE_TICKS;
+                    }
+                    None => {
+                        self.notice = None;
+                        self.notice_ticks = 0;
+                    }
+                }
+                true
             }
             _ => false,
         }
@@ -260,6 +295,13 @@ impl ZellijPlugin for State {
                 left.push_str(&label);
                 left.push_str(&fmt(bar_fg, bar_bg));
             }
+        }
+
+        // ── the notice zone: a transient system message next to the tabs ────
+        if let Some(notice) = &self.notice {
+            left.push(' ');
+            left.push_str(&pill(&format!(" {} ", notice), acc_fg, teal));
+            left.push_str(&fmt(bar_fg, bar_bg));
         }
 
         // ── right: CPU · MEM · online · clock ───────────────────────────────
