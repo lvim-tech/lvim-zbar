@@ -1,0 +1,14 @@
+[package]
+name = "lvim-zbar"
+version = "0.1.0"
+edition = "2021"
+authors = ["lvim-tech"]
+description = "Theme-following zellij status bar plugin"
+
+[dependencies]
+zellij-tile = "0.44.3"
+
+[profile.release]
+lto = true
+opt-level = "z"
+strip = true

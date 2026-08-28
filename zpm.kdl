@@ -1,0 +1,9 @@
+// lvim-zbar — the lvim-zpm manifest: a LAYOUT plugin (the status bar pane), so no keybinds here.
+// `link` makes the manager keep the built wasm installed at ~/.config/zellij/plugins/lvim-zbar.wasm
+// — the fixed path the layouts reference — refreshed whenever the repo's wasm changes; the
+// permissions are pre-granted for that installed copy.
+plugin {
+    wasm "lvim-zbar.wasm"
+    link "lvim-zbar.wasm"
+    permissions "ReadApplicationState" "ChangeApplicationState" "RunCommands" "InterceptInput" "MessageAndLaunchOtherPlugins" "ReadCliPipes"
+}
