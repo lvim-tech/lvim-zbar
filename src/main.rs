@@ -199,17 +199,22 @@ impl ZellijPlugin for State {
             // purpose: any plugin broadcast or `zellij pipe -n notice -- "text"`
             // lands here. Empty payload clears an existing notice early.
             "notice" => {
-                match message.payload.filter(|p| !p.trim().is_empty()) {
+                match message.payload {
+                    // A CLI pipe ends with a payload of None — the END of the stream, not a
+                    // message. Ignore it, or the notice would vanish the instant the CLI closes.
+                    None => false,
+                    // An explicitly EMPTY payload clears an existing notice early.
+                    Some(text) if text.trim().is_empty() => {
+                        self.notice = None;
+                        self.notice_ticks = 0;
+                        true
+                    }
                     Some(text) => {
                         self.notice = Some(text.trim().to_string());
                         self.notice_ticks = NOTICE_TICKS;
-                    }
-                    None => {
-                        self.notice = None;
-                        self.notice_ticks = 0;
+                        true
                     }
                 }
-                true
             }
             _ => false,
         }
@@ -298,9 +303,10 @@ impl ZellijPlugin for State {
         }
 
         // ── the notice zone: a transient system message next to the tabs ────
+        // Plain coloured text on the bar background — a pill would shout; a notice only speaks.
         if let Some(notice) = &self.notice {
-            left.push(' ');
-            left.push_str(&pill(&format!(" {} ", notice), acc_fg, teal));
+            left.push_str(&fmt(orange, bar_bg));
+            left.push_str(&format!("  {} ", notice));
             left.push_str(&fmt(bar_fg, bar_bg));
         }
 
