@@ -64,6 +64,10 @@ struct State {
 /// How many TICK periods a notice stays on the bar (TICK = 2s → ~6 seconds).
 const NOTICE_TICKS: u8 = 3;
 
+/// The load figures turn from blue to red at these levels.
+const CPU_WARN_PERCENT: u32 = 80;
+const MEM_WARN_PERCENT: u32 = 85;
+
 register_plugin!(State);
 
 impl ZellijPlugin for State {
@@ -229,9 +233,10 @@ impl ZellijPlugin for State {
         // raw palette in multiplayer_user_colors, so read the accents from there.
         let m = c.multiplayer_user_colors;
         let green = m.player_3;   // #75783a
-        let orange = m.player_4;  // #cc7942
         let yellow = m.player_8;  // #af9e6b
-        let teal = m.player_6;    // #357b6d
+        let teal = m.player_6;    // #357b6d — the palette's cyan
+        let blue = m.player_2;    // #42728b
+        let red = m.player_9;     // #cb4f4f — warnings
         let bar_bg = c.text_unselected.background;
         let bar_fg = c.text_unselected.base;
         let acc_bg = green;                         // clock/online pill
@@ -303,9 +308,10 @@ impl ZellijPlugin for State {
         }
 
         // ── the notice zone: a transient system message next to the tabs ────
-        // Plain coloured text on the bar background — a pill would shout; a notice only speaks.
+        // Plain coloured text (the theme's cyan) on the bar background — a pill would shout; a
+        // notice only speaks.
         if let Some(notice) = &self.notice {
-            left.push_str(&fmt(orange, bar_bg));
+            left.push_str(&fmt(teal, bar_bg));
             left.push_str(&format!("  {} ", notice));
             left.push_str(&fmt(bar_fg, bar_bg));
         }
@@ -313,11 +319,14 @@ impl ZellijPlugin for State {
         // ── right: CPU · MEM · online · clock ───────────────────────────────
         let mut right = String::new();
         if !self.cpu.is_empty() {
-            right.push_str(&fmt(orange, bar_bg));
+            // Blue while healthy, red past the warning threshold.
+            let warn = percent(&self.cpu).map_or(false, |p| p >= CPU_WARN_PERCENT);
+            right.push_str(&fmt(if warn { red } else { blue }, bar_bg));
             right.push_str(&format!(" CPU {} ", self.cpu));
         }
         if !self.mem.is_empty() {
-            right.push_str(&fmt(bar_fg, bar_bg));
+            let warn = used_of_total_percent(&self.mem).map_or(false, |p| p >= MEM_WARN_PERCENT);
+            right.push_str(&fmt(if warn { red } else { blue }, bar_bg));
             right.push_str(&format!("MEM {} ", self.mem));
         }
         if !self.online.is_empty() {
@@ -515,4 +524,26 @@ fn visible_width(s: &str) -> usize {
         }
     }
     w
+}
+
+/// "37%" → 37 (what cpu.sh prints).
+fn percent(s: &str) -> Option<u32> {
+    s.trim().trim_end_matches('%').parse().ok()
+}
+
+/// "20G/67G" → the used share as a percent (what mem.sh prints).
+fn used_of_total_percent(s: &str) -> Option<u32> {
+    let (used, total) = s.trim().split_once('/')?;
+    let number = |x: &str| -> Option<f32> {
+        x.trim()
+            .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+            .parse()
+            .ok()
+    };
+    let (used, total) = (number(used)?, number(total)?);
+    if total > 0.0 {
+        Some(((used / total) * 100.0).round() as u32)
+    } else {
+        None
+    }
 }
