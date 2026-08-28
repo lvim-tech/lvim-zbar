@@ -36,7 +36,9 @@ use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
 const TICK: f64 = 2.0;
-const SCRIPTS: &str = "/home/biserstoilov/.config/zellij/scripts";
+// Resolved by the host shell (run via `sh -c`), so it is portable and carries no
+// hardcoded username. The widget scripts live under the zellij config dir.
+const SCRIPTS: &str = "${ZELLIJ_CONFIG_DIR:-$HOME/.config/zellij}/scripts";
 const MAX_NAME_LEN: usize = 60;
 
 #[derive(Default)]
