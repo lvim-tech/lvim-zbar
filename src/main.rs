@@ -31,8 +31,22 @@
 //   its intercept. The same "rename_close" pipe is also accepted from the CLI
 //   (`zellij pipe --name rename_close`) as an external emergency unlock, so no
 //   instance can ever stay armed and hold the keyboard.
+//
+// THE HINTS BAR — the same wasm loaded a SECOND time, with `bar "hints"` in its
+// layout configuration, is the bar on TOP: it draws the keybinds of the current
+// mode (straight out of ModeInfo, which we already hold — no extra
+// subscription) and can be toggled away with a keybind that is itself never
+// drawn.
+//
+// The toggle has to survive one-instance-per-tab: a url-addressed keybind pipe
+// reaches EVERY status instance, so "flip it" would flip N times. What travels
+// between the instances is therefore the RESULTING state, never a flip — each
+// recipient computes the same next value and broadcasts the idempotent
+// "hints_set on|off", which every instance (both roles) applies to its shadow
+// of the state. See the pipe() arms.
 
 use std::collections::BTreeMap;
+use zellij_tile::prelude::actions::{Action, SearchDirection, SearchOption};
 use zellij_tile::prelude::*;
 
 const TICK: f64 = 2.0;
@@ -40,6 +54,20 @@ const TICK: f64 = 2.0;
 // hardcoded username. The widget scripts live under the zellij config dir.
 const SCRIPTS: &str = "${ZELLIJ_CONFIG_DIR:-$HOME/.config/zellij}/scripts";
 const MAX_NAME_LEN: usize = 60;
+
+/// The pipe name the toggle keybind sends — and the ONE bind the hints bar
+/// never draws, so the combination that summons it stays invisible.
+const HINTS_TOGGLE: &str = "hints_toggle";
+/// Which of the two bars this instance is. One wasm, two roles, told apart by
+/// the layout's plugin configuration (`bar "hints"`).
+#[derive(Default, PartialEq, Clone, Copy)]
+enum Role {
+    /// The bar at the bottom: mode, session, tabs, notice, widgets.
+    #[default]
+    Status,
+    /// The bar on top: the current mode's keybinding hints.
+    Hints,
+}
 
 #[derive(Default)]
 struct State {
@@ -61,6 +89,14 @@ struct State {
     // ticks; a new notice simply replaces the old one.
     notice: Option<String>,
     notice_ticks: u8,
+    // Which bar this instance draws.
+    role: Role,
+    // Our own pane id, so we can hide/show THIS pane without touching focus.
+    own_id: u32,
+    // Shadow of the hints bar's state, kept by BOTH roles: every instance has
+    // to compute the same next value for the idempotent toggle broadcast.
+    // Hidden rather than visible, so the derived Default (false) means "shown".
+    hints_hidden: bool,
 }
 
 /// How many TICK periods a notice stays on the bar (TICK = 2s → ~6 seconds).
@@ -73,10 +109,18 @@ const MEM_WARN_PERCENT: u32 = 85;
 register_plugin!(State);
 
 impl ZellijPlugin for State {
-    fn load(&mut self, _configuration: BTreeMap<String, String>) {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
         // A status bar must never take focus, or keys (splits, etc.) would land
         // on it instead of the shell.
         set_selectable(false);
+        // Two bars out of one wasm: `bar "hints"` in the layout makes this
+        // instance the keybinding-hints bar on top. Anything else — including no
+        // configuration at all, which is how the status bar is loaded and what
+        // the url-addressed keybind pipes match — is the status bar.
+        if configuration.get("bar").map(String::as_str) == Some("hints") {
+            self.role = Role::Hints;
+        }
+        self.own_id = get_plugin_ids().plugin_id;
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::RunCommands,
@@ -100,7 +144,19 @@ impl ZellijPlugin for State {
             Event::PermissionRequestResult(_) => {
                 if !self.permitted {
                     self.permitted = true;
-                    self.sample();
+                    // Only the status bar has widgets; sampling on the hints bar
+                    // would run every widget script twice per tick.
+                    if self.role == Role::Status {
+                        self.sample();
+                    }
+                    // MessageAndLaunchOtherPlugins is granted only now, so this
+                    // is the earliest we can ask the instances in the other tabs
+                    // whether the hints bar is currently on. In the first tab
+                    // nobody answers and the default (shown) stands.
+                    pipe_message_to_plugin(
+                        MessageToPlugin::new("hints_query")
+                            .with_payload(self.own_id.to_string()),
+                    );
                 }
                 true
             }
@@ -205,6 +261,11 @@ impl ZellijPlugin for State {
             // purpose: any plugin broadcast or `zellij pipe -n notice -- "text"`
             // lands here. Empty payload clears an existing notice early.
             "notice" => {
+                // The hints bar has no notice zone — and no timer to age one
+                // out, so it must not keep the state either.
+                if self.role != Role::Status {
+                    return false;
+                }
                 match message.payload {
                     // A CLI pipe ends with a payload of None — the END of the stream, not a
                     // message. Ignore it, or the notice would vanish the instant the CLI closes.
@@ -222,11 +283,67 @@ impl ZellijPlugin for State {
                     }
                 }
             }
+            // The toggle keybind (`MessagePlugin ... { name "hints_toggle"; }`).
+            // It is url-addressed, so it lands on every STATUS instance — one
+            // per tab. Nobody flips anything here: each recipient computes the
+            // same next state from its own shadow and broadcasts it as the
+            // idempotent "hints_set", so N deliveries do the work of one.
+            //
+            // Keybind source only. A CLI pipe ends with a payload of None — a
+            // second delivery that would toggle straight back; from the CLI use
+            // "hints_set" instead, which says what it means.
+            HINTS_TOGGLE => {
+                if message.source == PipeSource::Keybind {
+                    self.broadcast_hints_state(!self.hints_hidden);
+                }
+                false
+            }
+            // The one authoritative message: the hints bar is on, or it is off.
+            // Sent by the toggle above, as the answer to a newcomer's
+            // "hints_query", and usable from the CLI:
+            //   zellij pipe --name hints_set -- off
+            "hints_set" => {
+                // A CLI pipe's terminating None is the end of the stream, not a
+                // message (the same gotcha as "notice").
+                let Some(state) = message.payload else {
+                    return false;
+                };
+                let hidden = state.trim() == "off";
+                if hidden == self.hints_hidden {
+                    return false;
+                }
+                self.hints_hidden = hidden;
+                if self.role == Role::Hints {
+                    self.apply_hints_visibility();
+                    return true;
+                }
+                false
+            }
+            // A freshly loaded instance (a new tab) asking what the state is.
+            // The payload is the asker's own plugin id, because the broadcast
+            // comes back to the sender too and it must not answer itself.
+            "hints_query" => {
+                if message.payload.as_deref() != Some(self.own_id.to_string().as_str()) {
+                    self.broadcast_hints_state(self.hints_hidden);
+                }
+                false
+            }
             _ => false,
         }
     }
 
     fn render(&mut self, _rows: usize, cols: usize) {
+        match self.role {
+            Role::Status => self.render_status(cols),
+            Role::Hints => self.render_hints(cols),
+        }
+    }
+}
+
+impl State {
+    // The bar at the bottom: mode pill · session pill · tabs · notice, then the
+    // widgets on the right.
+    fn render_status(&self, cols: usize) {
         let c = self.mode_info.style.colors;
         // Accent pills carry dark text on a coloured background, so they want the
         // RAW palette accents — not the contrast-floored versions the zellij
@@ -260,19 +377,7 @@ impl ZellijPlugin for State {
         let mode = if session_editing {
             "RENAME"
         } else {
-            match self.mode_info.mode {
-                InputMode::Locked => "LOCKED",
-                InputMode::Tmux => "PREFIX",
-                InputMode::Pane => "PANE",
-                InputMode::Tab => "TAB",
-                InputMode::Resize => "RESIZE",
-                InputMode::Move => "MOVE",
-                InputMode::Scroll => "SCROLL",
-                InputMode::EnterSearch | InputMode::Search => "SEARCH",
-                InputMode::RenameTab | InputMode::RenamePane => "RENAME",
-                InputMode::Session => "SESSION",
-                _ => "NORMAL",
-            }
+            mode_label(&self.mode_info.mode)
         };
 
         // ── left: mode pill · session pill · tabs ───────────────────────────
@@ -349,9 +454,123 @@ impl ZellijPlugin for State {
         out.push_str("\u{1b}[0m");
         print!("{}", out);
     }
-}
 
-impl State {
+    // The bar on top: the current mode's keybinds. While it is toggled off it
+    // draws an EMPTY line — whether or not the host actually reclaimed the row,
+    // the worst case is then a blank bar and not a stale one.
+    //
+    // No mode pill here: the key boxes are painted in the mode's own colour (and
+    // the bar at the bottom names the mode anyway), which buys back the width.
+    fn render_hints(&self, cols: usize) {
+        let c = self.mode_info.style.colors;
+        let blank = format!(
+            "{}{}\u{1b}[0m",
+            fmt(c.text_unselected.base, c.text_unselected.background),
+            " ".repeat(cols)
+        );
+        if self.hints_hidden {
+            print!("{}", blank);
+            return;
+        }
+        // The native bar's answer to a narrow terminal: render the hints at
+        // several levels of detail and show the fullest one that fits, rather
+        // than cutting the tail off the only rendering there is.
+        let hints = hint_groups(&self.mode_info);
+        let line = self
+            .compose_hints(&hints, Level::AllKeys, cols, false)
+            .or_else(|| self.compose_hints(&hints, Level::OneKey, cols, false))
+            // Still too long: cut the tail and say so with an ellipsis. Bare
+            // keys would fit far more of them, but a key with no name teaches
+            // nothing — better fewer hints that still mean something, and
+            // hint_groups has already put the important ones first.
+            // (`cut` always yields a line, so the blank is unreachable.)
+            .or_else(|| self.compose_hints(&hints, Level::OneKey, cols, true))
+            .unwrap_or(blank);
+        print!("{}", line);
+    }
+
+    // One rendering of the hints at a given level of detail: each hint is a KEY
+    // box in the mode's own colour, then — square edge to square edge, no arrow
+    // separators — a NEUTRAL label box saying what the key does.
+    //
+    // Returns None when the line does not fit and `cut` is off; that is the
+    // caller's signal to try a shorter level instead of amputating this one.
+    fn compose_hints(
+        &self,
+        hints: &[Hint],
+        level: Level,
+        cols: usize,
+        cut: bool,
+    ) -> Option<String> {
+        let c = self.mode_info.style.colors;
+        let bar_bg = c.text_unselected.background;
+        let bar_fg = c.text_unselected.base;
+        // Taken from zellij's own status bar (sampled off it, pixel for pixel):
+        // the key is emphasis_2 straight on the bar, the label is a ribbon.
+        let key_bg = bar_bg;
+        let key_fg = c.text_unselected.emphasis_2;
+        let label_bg = c.ribbon_unselected.background;
+        let label_fg = c.ribbon_unselected.base;
+
+        let mut out = String::new();
+        out.push_str(&fmt(bar_fg, bar_bg));
+        let mut width = 0usize;
+        for hint in hints {
+            let keys = match level {
+                Level::AllKeys => hint.keys.join("|"),
+                _ => hint.best_key().to_string(),
+            };
+            let label = hint.label.as_str();
+            // the key and its padding + the gap after the hint, plus the label
+            // box with a space either side.
+            let need = keys.chars().count() + 3 + label.chars().count() + 2;
+            if width + need > cols {
+                if !cut {
+                    return None;
+                }
+                if width + 2 <= cols {
+                    out.push_str(&fmt(key_bg, bar_bg));
+                    out.push_str(" \u{2026}");
+                    width += 2;
+                }
+                break;
+            }
+            width += need;
+            out.push_str(&pill(&format!(" {} ", keys), key_fg, key_bg));
+            // Deliberately not bold: the key shouts, the label only names.
+            out.push_str(&fmt(label_fg, label_bg));
+            out.push_str(&format!(" {} ", label));
+            out.push_str(&fmt(bar_fg, bar_bg));
+            out.push(' ');
+        }
+        out.push_str(&" ".repeat(cols.saturating_sub(width)));
+        out.push_str("\u{1b}[0m");
+        Some(out)
+    }
+
+    // Tell every instance — both roles — what the hints bar's state IS. The
+    // message carries the result and never "flip", so the N copies a
+    // url-addressed keybind produces collapse into a single effect. Url-less
+    // broadcast, for the reason spelled out on end_session_edit().
+    fn broadcast_hints_state(&self, hidden: bool) {
+        pipe_message_to_plugin(
+            MessageToPlugin::new("hints_set").with_payload(if hidden { "off" } else { "on" }),
+        );
+    }
+
+    // Hide or show THIS pane. Deliberately not hide_self()/show_self(): the
+    // latter is documented to focus the pane and switch to its tab, and a bar
+    // must never take focus — the pane-id variants take an explicit
+    // "do not focus" flag instead.
+    fn apply_hints_visibility(&self) {
+        let id = PaneId::Plugin(self.own_id);
+        if self.hints_hidden {
+            hide_pane_with_id(id);
+        } else {
+            show_pane_with_id(id, false, false);
+        }
+    }
+
     fn sample(&mut self) {
         run(&["sh", "-c", &format!("{}/cpu.sh", SCRIPTS)], "cpu");
         run(&["sh", "-c", &format!("{}/mem.sh", SCRIPTS)], "mem");
@@ -474,6 +693,265 @@ fn tab_display_name(tab: &TabInfo) -> String {
         format!("Tab {}", tab.position + 1)
     } else {
         tab.name.clone()
+    }
+}
+
+// The bar's name for a mode — shared by both bars, so a mode switch hint on top
+// reads exactly like the pill that appears at the bottom once you take it.
+fn mode_label(mode: &InputMode) -> &'static str {
+    match mode {
+        InputMode::Locked => "LOCKED",
+        InputMode::Tmux => "PREFIX",
+        InputMode::Pane => "PANE",
+        InputMode::Tab => "TAB",
+        InputMode::Resize => "RESIZE",
+        InputMode::Move => "MOVE",
+        InputMode::Scroll => "SCROLL",
+        InputMode::EnterSearch | InputMode::Search => "SEARCH",
+        InputMode::RenameTab | InputMode::RenamePane => "RENAME",
+        InputMode::Session => "SESSION",
+        _ => "NORMAL",
+    }
+}
+
+/// One hint: the keys that do a thing, and zellij's own name for the thing.
+struct Hint {
+    keys: Vec<String>,
+    label: String,
+}
+
+impl Hint {
+    // The key to show when there is room for only one: the shortest, which
+    // picks the plain letter over "Ctrl+..." and over an arrow key.
+    fn best_key(&self) -> &str {
+        self.keys
+            .iter()
+            .min_by_key(|key| key.chars().count())
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+}
+
+/// How much of a hint survives — the rungs the hints bar climbs down when the
+/// terminal is too narrow for the fullest rendering, the way the native bar
+/// does it rather than amputating the tail of a single rendering.
+#[derive(Clone, Copy, PartialEq)]
+enum Level {
+    /// Every key that does the job: `h/j/k/l` `Move focus`.
+    AllKeys,
+    /// One key per hint: `h` `Move focus`.
+    OneKey,
+}
+
+// The wording never shrinks — zellij's own words are the point of the bar, and
+// "Down" in place of "Split down" reads as a different bar. Width buys fewer
+// keys and then fewer hints, never abbreviations.
+
+/// The order zellij's own bar puts its hints in, extended with the rest of what
+/// we can label. Anything not listed keeps its place in the config, after these
+/// — so when the line has to be cut, what goes is what matters least.
+const HINT_ORDER: &[&str] = &[
+    // The head follows zellij's own tmux-mode line, hint for hint.
+    "Move focus",
+    "Split down",
+    "Split right",
+    "Split left",
+    "Split up",
+    "New Pane",
+    "Fullscreen",
+    "New tab",
+    "Close",
+    "Rename tab",
+    "Rename pane",
+    "Previous Tab",
+    "Next Tab",
+    "Select pane",
+    // Then the rest of what we can label, most-reached-for first.
+    "Toggle Floating",
+    "Toggle Embed",
+    "New Floating",
+    "Stack",
+    "Increase/Decrease size",
+    "Move pane",
+    "Move tab",
+    "Toggle",
+    "Detach",
+    "Quit",
+    "Scroll",
+    "Enter search term",
+    "Search down",
+    "Search up",
+    "Case sensitive",
+    "Whole words",
+    "Edit scrollback in default editor",
+    "Break pane to new tab",
+    "Break pane left/right",
+    "Switch Location",
+    "Sync",
+    "Frames",
+    "Pin",
+    "Copy",
+    "Clear",
+    "Run",
+    "Plugin Manager",
+];
+
+// The current mode's keybinds, grouped by what they DO: one hint per label — so
+// the six keys that scroll become a single "j|k|Ctrl f|Ctrl b|d|u Scroll", the
+// way zellij groups them — then ordered by HINT_ORDER.
+fn hint_groups(mode_info: &ModeInfo) -> Vec<Hint> {
+    let mut hints: Vec<Hint> = Vec::new();
+    for (key, actions) in mode_info.get_mode_keybinds() {
+        let Some(label) = action_label(&actions, mode_info.mode) else {
+            continue;
+        };
+        let key = key.to_string();
+        match hints.iter_mut().find(|hint| hint.label == label) {
+            Some(hint) => {
+                // Every key, however many: zellij prints all six of
+                // "j|k|Ctrl f|Ctrl b|d|u" and the width ladder handles the rest.
+                if !hint.keys.contains(&key) {
+                    hint.keys.push(key);
+                }
+            }
+            None => hints.push(Hint { label, keys: vec![key] }),
+        }
+    }
+    // Stable, so hints sharing a rank (and everything unlisted) keep the order
+    // they have in the config.
+    hints.sort_by_key(|hint| {
+        HINT_ORDER
+            .iter()
+            .position(|known| *known == hint.label)
+            .unwrap_or(HINT_ORDER.len())
+    });
+    hints
+}
+
+// One bind may carry several actions; the first one that has a name gives the
+// hint its label.
+fn action_label(actions: &[Action], mode: InputMode) -> Option<String> {
+    actions.iter().find_map(|action| single_action_label(action, mode))
+}
+
+// What an action is called, or None for the ones that would only add noise
+// (per-tab jumps, raw writes to the terminal) — and for OUR OWN toggle, the one
+// bind the hints bar must never advertise.
+//
+// The words are zellij's own, lifted from its status bar so the two bars read
+// identically.
+fn single_action_label(action: &Action, mode: InputMode) -> Option<String> {
+    let label = match action {
+        Action::SwitchToMode { input_mode } | Action::SwitchModeForAllClients { input_mode } => {
+            return Some(switch_label(*input_mode, mode))
+        }
+        Action::SkipConfirm { action } => return single_action_label(action, mode),
+        Action::KeybindPipe { name, .. } => {
+            let name = name.as_deref()?;
+            if name == HINTS_TOGGLE {
+                return None;
+            }
+            return Some(humanise(name));
+        }
+        Action::NewPane { direction: Some(Direction::Down), .. }
+        | Action::NewTiledPane { direction: Some(Direction::Down), .. } => "Split down",
+        Action::NewPane { direction: Some(Direction::Right), .. }
+        | Action::NewTiledPane { direction: Some(Direction::Right), .. } => "Split right",
+        Action::NewPane { direction: Some(Direction::Left), .. }
+        | Action::NewTiledPane { direction: Some(Direction::Left), .. } => "Split left",
+        Action::NewPane { direction: Some(Direction::Up), .. }
+        | Action::NewTiledPane { direction: Some(Direction::Up), .. } => "Split up",
+        Action::NewPane { .. } | Action::NewTiledPane { .. } | Action::NewInPlacePane { .. } => {
+            "New Pane"
+        }
+        Action::NewStackedPane { .. } => "Stack",
+        Action::NewFloatingPane { .. } => "New Floating",
+        Action::NewTab { .. } => "New tab",
+        Action::CloseFocus | Action::CloseTab => "Close",
+        Action::ToggleFocusFullscreen => "Fullscreen",
+        Action::TogglePaneFrames => "Frames",
+        Action::ToggleFloatingPanes => "Toggle Floating",
+        Action::TogglePaneEmbedOrFloating => "Toggle Embed",
+        Action::TogglePanePinned => "Pin",
+        Action::ToggleActiveSyncTab => "Sync",
+        Action::MoveFocus { .. } | Action::MoveFocusOrTab { .. } => "Move focus",
+        Action::SwitchFocus | Action::FocusNextPane | Action::FocusPreviousPane => {
+            "Select pane"
+        }
+        Action::MovePane { .. } | Action::MovePaneBackwards => "Move pane",
+        Action::MoveTab { .. } => "Move tab",
+        Action::GoToNextTab => "Next Tab",
+        Action::GoToPreviousTab => "Previous Tab",
+        Action::ToggleTab => "Toggle",
+        Action::Resize { .. } => "Increase/Decrease size",
+        // One hint for every kind of scrolling — zellij groups them, so a scroll
+        // mode reads "j|k|Ctrl f|Ctrl b|d|u Scroll" and not three separate hints.
+        Action::ScrollUp
+        | Action::ScrollDown
+        | Action::ScrollToTop
+        | Action::ScrollToBottom
+        | Action::PageScrollUp
+        | Action::PageScrollDown
+        | Action::HalfPageScrollUp
+        | Action::HalfPageScrollDown => "Scroll",
+        Action::EditScrollback { .. } => "Edit scrollback in default editor",
+        Action::Search { direction: SearchDirection::Down } => "Search down",
+        Action::Search { direction: SearchDirection::Up } => "Search up",
+        Action::SearchToggleOption { option: SearchOption::CaseSensitivity } => {
+            "Case sensitive"
+        }
+        Action::SearchToggleOption { option: SearchOption::WholeWord } => "Whole words",
+        Action::SearchToggleOption { option: SearchOption::Wrap } => "Wrap",
+        Action::BreakPane => "Break pane to new tab",
+        Action::BreakPaneLeft | Action::BreakPaneRight => "Break pane left/right",
+        Action::PreviousSwapLayout | Action::NextSwapLayout => "Switch Location",
+        Action::ClearScreen => "Clear",
+        Action::Copy => "Copy",
+        Action::Confirm => "Yes",
+        Action::Deny => "No",
+        Action::Run { .. } => "Run",
+        Action::LaunchOrFocusPlugin { .. }
+        | Action::LaunchPlugin { .. }
+        | Action::NewTiledPluginPane { .. }
+        | Action::NewFloatingPluginPane { .. }
+        | Action::NewInPlacePluginPane { .. } => "Plugin Manager",
+        Action::Detach => "Detach",
+        Action::Quit => "Quit",
+        _ => return None,
+    };
+    Some(label.to_string())
+}
+
+// Where a mode switch goes. Leaving a mode is "Back" (that is what Esc does
+// from inside one), leaving Locked is "Unlock"; the rename modes get zellij's
+// own wording, and everything else names the mode it enters, in the same words
+// as the pill on the status bar.
+fn switch_label(target: InputMode, current: InputMode) -> String {
+    match (current, target) {
+        (InputMode::Locked, InputMode::Normal) => "Unlock",
+        (_, InputMode::Locked) => "Lock",
+        (InputMode::RenameTab, InputMode::Normal) | (InputMode::RenamePane, InputMode::Normal) => {
+            "When done"
+        }
+        // zellij calls the way out of a mode "Select pane" — you go back to using
+        // the panes. (It drops the hint entirely when the mode IS the base mode.)
+        (current, InputMode::Normal) if current != InputMode::Normal => "Select pane",
+        (_, InputMode::RenameTab) => "Rename tab",
+        (_, InputMode::RenamePane) => "Rename pane",
+        (_, InputMode::EnterSearch) => "Enter search term",
+        (_, target) => mode_label(&target),
+    }
+    .to_string()
+}
+
+// A pipe-bind has no action to name it — a foreign plugin's keybind is labelled
+// by its pipe name, made readable: "rename_session_start" -> "Rename session start".
+fn humanise(name: &str) -> String {
+    let spaced = name.replace('_', " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => spaced,
     }
 }
 
