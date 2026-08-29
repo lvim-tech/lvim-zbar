@@ -5,7 +5,7 @@ A theme-following status bar plugin for [zellij](https://zellij.dev), with inlin
 ## What it shows
 
 ```
- v  Split down   h  Split right   +  Fullscreen   c  New tab   …    (the hints bar, optional)
+ v  Split down   h  Split right   +  Fullscreen   c  New tab   ...   (the hints bar, optional)
  mode · session · tabs                                    CPU · MEM · online · clock
 ```
 
@@ -84,33 +84,40 @@ layout {
 ```
 
 The hints come out of `ModeInfo`, which the plugin already receives on every mode and theme change,
-so the top bar needs no extra permission and no polling. Keys that do the same thing share one hint
-(`h/j/k/l` `Focus`).
+so the top bar needs no extra permission and no polling.
 
-### Same colours, same words as zellij's own bar
+### The same hints as zellij, drawn our way
 
-The palette is zellij's status bar's, sampled off it: the **key** is `text_unselected.emphasis_2`
-straight on the bar, the **label** is a ribbon — `ribbon_unselected.base` on
-`ribbon_unselected.background`. The wording is zellij's too (`Split down`, `Previous Tab`,
-`Increase/Decrease size`, …), so the two bars read identically. The one deliberate difference: the
-boxes are square, with no arrow separators, and there is no mode pill (the bar at the bottom names
-the mode).
+**What it says** is a port of zellij's own one-line status bar. That bar sends a one-row pane to
+`one_line_ui()` (`default-plugins/status-bar/src/one_line_ui.rs`), and this one reimplements it:
 
-### When it does not fit
+- **`get_keys_and_hints`** — the curated per-mode table: which hints, in what order, each with a
+  long and a short wording. Not "everything we can name".
+- **`action_key`** — which key a hint gets, by an *exact* match on the action sequence. This is why
+  a hint can be missing: zellij's "Rename tab" wants `SwitchToMode(RenameTab)` **and**
+  `TabNameInput`, so `bind "r" { SwitchToMode "renametab"; }` earns no hint — in zellij's bar
+  either.
+- **the width ladder** — long wordings, then short ones, then as many short ones as fit followed by
+  `" ... "`.
 
-Like zellij's own bar, the line is rendered at more than one level of detail and the fullest one
-that fits wins, rather than amputating the only rendering there is:
+**How it looks** is not zellij's. Its hints are powerline ribbons, arrows on both ends, opened by a
+separator arrow that divides the mode indicators from the hints. This bar draws no mode indicators,
+so that separator would divide nothing; and the boxes are square:
 
-1. every key that does the job — `h/j/k/l` `Move focus`
-2. one key per hint — `h` `Move focus`
+```
+ v  Split down   h  Split right   +  Fullscreen   c  New tab   ...
+```
 
-The wording never shrinks: `Down` in place of `Split down` reads as a different bar. Width buys
-fewer keys and then fewer hints, so if even one key per hint overflows, the tail is cut with a
-trailing `…`. What goes first is what matters least — the hints are ordered by `HINT_ORDER`, whose
-head is zellij's own tmux-mode line, hint for hint.
+The **key** is the theme's yellow — `multiplayer_user_colors.player_8`, which is where the lvim
+colorschemes put it — on the bar's own background. The **label** is `ribbon_unselected.base` on
+`ribbon_unselected.background`, the shade of the active tab. Both bold, one space between hints.
+Accents come from the raw `multiplayer_user_colors` for the same reason the bottom bar's do: the
+`text_unselected` slots are contrast-flattened by the theme exporter.
 
-Bear in mind zellij's bar shows a *curated* handful per mode while this one shows everything it can
-label, so a mode with twenty-odd binds will end in `…` where the native bar does not.
+The one mode zellij's table does not cover is **Normal** (and Locked): there its one-line bar shows
+*mode indicators* instead of hints. An empty top bar in the mode you spend your time in is useless
+and the mode indicators duplicate the bottom bar's mode pill, so those two keep this plugin's own
+list — every bind it can name — drawn and cut the same way.
 
 ### Toggling it
 
@@ -118,9 +125,10 @@ The toggle is a keybind of your own — the plugin never sees which one, it only
 
 ```kdl
 keybinds {
-    shared_except "locked" {
-        bind "Alt H" {
+    tmux {
+        bind "o" {
             MessagePlugin "file:~/.config/zellij/plugins/lvim-zbar.wasm" { name "hints_toggle"; };
+            SwitchToMode "normal";
         }
     }
 }
@@ -130,7 +138,9 @@ keybinds {
 action, and the bar skips the one named `hints_toggle` — every other plugin keybind (the `R` above,
 for instance) is still listed, under its pipe name.
 
-`Alt H` is only a suggestion; any free binding works, and the pipe name is what matters.
+The bind above lives in a mode, so it is reached as a prefix chord (`Ctrl s` then `o` with the
+keybinds in this README's config). Any free binding works — a `shared_except "locked"` one too, if
+your terminal really delivers it; the pipe name is the only part the plugin knows about.
 
 From the CLI the state is set rather than flipped:
 
@@ -149,10 +159,10 @@ state and broadcasts `hints_set on|off`, which is idempotent: N deliveries do th
 newly loaded instance (a new tab) asks its siblings with `hints_query` and they answer with the
 same `hints_set`, so a new tab opens with the hints bar in the state the rest of the session is in.
 
-Hiding uses `hide_pane_with_id` / `show_pane_with_id(..., should_focus_pane: false)` rather than
-`hide_self` / `show_self`: the latter is documented to focus the pane and switch to its tab, and a
-bar must never take focus. While toggled off the bar also draws an empty line, so a host that does
-not reclaim the row leaves a blank bar rather than a stale one.
+Off means an **empty line**, not a hidden pane. `hide_pane_with_id` / `show_pane_with_id` looked
+like the tidier answer, but it never handed the row back — the terminal pane below reports the same
+height either way — and it did shift the panes around it on the way back. The row was going to stay
+reserved regardless, so the bar simply stops drawing.
 
 ## The right-side widgets
 

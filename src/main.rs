@@ -34,9 +34,15 @@
 //
 // THE HINTS BAR — the same wasm loaded a SECOND time, with `bar "hints"` in its
 // layout configuration, is the bar on TOP: it draws the keybinds of the current
-// mode (straight out of ModeInfo, which we already hold — no extra
-// subscription) and can be toggled away with a keybind that is itself never
-// drawn.
+// mode and can be toggled away with a keybind that is itself never drawn.
+//
+// WHAT it says is a port of zellij's own one-line status bar: the same curated
+// per-mode table, the same wording long and short, the same rule for which key a
+// hint gets, the same width ladder. See get_keys_and_hints().
+//
+// HOW it looks is ours: square boxes rather than zellij's powerline ribbons, no
+// separator arrow in front (it divides the mode indicators from the hints, and we
+// draw no mode indicators), and the key in the theme's yellow.
 //
 // The toggle has to survive one-instance-per-tab: a url-addressed keybind pipe
 // reaches EVERY status instance, so "flip it" would flip N times. What travels
@@ -44,6 +50,10 @@
 // recipient computes the same next value and broadcasts the idempotent
 // "hints_set on|off", which every instance (both roles) applies to its shadow
 // of the state. See the pipe() arms.
+//
+// Off means an EMPTY line, not a hidden pane. hide_pane_with_id never handed the
+// row back (the terminal pane's height is the same either way, measured) and it
+// did shift the panes around it, so the bar simply stops drawing.
 
 use std::collections::BTreeMap;
 use zellij_tile::prelude::actions::{Action, SearchDirection, SearchOption};
@@ -313,11 +323,12 @@ impl ZellijPlugin for State {
                     return false;
                 }
                 self.hints_hidden = hidden;
-                if self.role == Role::Hints {
-                    self.apply_hints_visibility();
-                    return true;
-                }
-                false
+                // Only a repaint: the pane stays where the layout put it. Hiding
+                // it with hide_pane_with_id/show_pane_with_id never gave the row
+                // back (measured: the terminal pane's height does not change) and
+                // did disturb the geometry around it, so what "off" means here is
+                // an empty line.
+                self.role == Role::Hints
             }
             // A freshly loaded instance (a new tab) asking what the state is.
             // The payload is the asker's own plugin id, because the broadcast
@@ -459,93 +470,43 @@ impl State {
     // draws an EMPTY line — whether or not the host actually reclaimed the row,
     // the worst case is then a blank bar and not a stale one.
     //
-    // No mode pill here: the key boxes are painted in the mode's own colour (and
-    // the bar at the bottom names the mode anyway), which buys back the width.
+    // The hints bar draws what zellij's own one-line bar draws, through zellij's
+    // own UI components: the key is serialized text, the label a ribbon, and the
+    // HOST turns both into arrows, colours and bold with the very code that
+    // paints its native bar. Nothing here knows the theme.
     fn render_hints(&self, cols: usize) {
-        let c = self.mode_info.style.colors;
-        let blank = format!(
-            "{}{}\u{1b}[0m",
-            fmt(c.text_unselected.base, c.text_unselected.background),
-            " ".repeat(cols)
-        );
+        // Exactly zellij's fill: set the bar background and erase to the end of
+        // the line, so the row is uniform however long the content came out.
+        let fill = match self.mode_info.style.colors.text_unselected.background {
+            PaletteColor::Rgb((r, g, b)) => format!("\u{1b}[48;2;{};{};{}m\u{1b}[0K", r, g, b),
+            PaletteColor::EightBit(n) => format!("\u{1b}[48;5;{}m\u{1b}[0K", n),
+        };
         if self.hints_hidden {
-            print!("{}", blank);
+            print!("{}", fill);
             return;
         }
-        // The native bar's answer to a narrow terminal: render the hints at
-        // several levels of detail and show the fullest one that fits, rather
-        // than cutting the tail off the only rendering there is.
-        let hints = hint_groups(&self.mode_info);
-        let line = self
-            .compose_hints(&hints, Level::AllKeys, cols, false)
-            .or_else(|| self.compose_hints(&hints, Level::OneKey, cols, false))
-            // Still too long: cut the tail and say so with an ellipsis. Bare
-            // keys would fit far more of them, but a key with no name teaches
-            // nothing — better fewer hints that still mean something, and
-            // hint_groups has already put the important ones first.
-            // (`cut` always yields a line, so the blank is unreachable.)
-            .or_else(|| self.compose_hints(&hints, Level::OneKey, cols, true))
-            .unwrap_or(blank);
-        print!("{}", line);
-    }
 
-    // One rendering of the hints at a given level of detail: each hint is a KEY
-    // box in the mode's own colour, then — square edge to square edge, no arrow
-    // separators — a NEUTRAL label box saying what the key does.
-    //
-    // Returns None when the line does not fit and `cut` is off; that is the
-    // caller's signal to try a shorter level instead of amputating this one.
-    fn compose_hints(
-        &self,
-        hints: &[Hint],
-        level: Level,
-        cols: usize,
-        cut: bool,
-    ) -> Option<String> {
-        let c = self.mode_info.style.colors;
-        let bar_bg = c.text_unselected.background;
-        let bar_fg = c.text_unselected.base;
-        // Taken from zellij's own status bar (sampled off it, pixel for pixel):
-        // the key is emphasis_2 straight on the bar, the label is a ribbon.
-        let key_bg = bar_bg;
-        let key_fg = c.text_unselected.emphasis_2;
-        let label_bg = c.ribbon_unselected.background;
-        let label_fg = c.ribbon_unselected.base;
-
-        let mut out = String::new();
-        out.push_str(&fmt(bar_fg, bar_bg));
+        let mut line = String::new();
         let mut width = 0usize;
-        for hint in hints {
-            let keys = match level {
-                Level::AllKeys => hint.keys.join("|"),
-                _ => hint.best_key().to_string(),
-            };
-            let label = hint.label.as_str();
-            // the key and its padding + the gap after the hint, plus the label
-            // box with a space either side.
-            let need = keys.chars().count() + 3 + label.chars().count() + 2;
-            if width + need > cols {
-                if !cut {
-                    return None;
-                }
-                if width + 2 <= cols {
-                    out.push_str(&fmt(key_bg, bar_bg));
-                    out.push_str(" \u{2026}");
-                    width += 2;
-                }
-                break;
-            }
-            width += need;
-            out.push_str(&pill(&format!(" {} ", keys), key_fg, key_bg));
-            // Deliberately not bold: the key shouts, the label only names.
-            out.push_str(&fmt(label_fg, label_bg));
-            out.push_str(&format!(" {} ", label));
-            out.push_str(&fmt(bar_fg, bar_bg));
-            out.push(' ');
+        // zellij opens the line with add_keygroup_separator(): an orange arrow
+        // dividing the mode indicators from the hints. We do not draw the mode
+        // indicators, so the arrow would divide nothing — only the word for what
+        // is being typed survives, as a box like every other.
+        let (help, help_len) = mode_help_box(&self.mode_info);
+        if help_len <= cols {
+            line.push_str(&help);
+            width += help_len;
         }
-        out.push_str(&" ".repeat(cols.saturating_sub(width)));
-        out.push_str("\u{1b}[0m");
-        Some(out)
+
+        let hints = get_keys_and_hints(&self.mode_info);
+        // zellij's table is empty for Normal and Locked — there its one-line bar
+        // shows mode indicators instead of hints. An empty bar in the mode you
+        // live in would be useless, so those two keep our own derived list; the
+        // rendering and the width ladder are the native ones either way.
+        let hints = if hints.is_empty() { derived_hints(&self.mode_info) } else { hints };
+        let (body, _) = keybinds(&self.mode_info, &hints, cols.saturating_sub(width));
+        line.push_str(&body);
+        print!("{}{}", line, fill);
     }
 
     // Tell every instance — both roles — what the hints bar's state IS. The
@@ -556,19 +517,6 @@ impl State {
         pipe_message_to_plugin(
             MessageToPlugin::new("hints_set").with_payload(if hidden { "off" } else { "on" }),
         );
-    }
-
-    // Hide or show THIS pane. Deliberately not hide_self()/show_self(): the
-    // latter is documented to focus the pane and switch to its tab, and a bar
-    // must never take focus — the pane-id variants take an explicit
-    // "do not focus" flag instead.
-    fn apply_hints_visibility(&self) {
-        let id = PaneId::Plugin(self.own_id);
-        if self.hints_hidden {
-            hide_pane_with_id(id);
-        } else {
-            show_pane_with_id(id, false, false);
-        }
     }
 
     fn sample(&mut self) {
@@ -714,119 +662,424 @@ fn mode_label(mode: &InputMode) -> &'static str {
     }
 }
 
-/// One hint: the keys that do a thing, and zellij's own name for the thing.
-struct Hint {
-    keys: Vec<String>,
-    label: String,
+// ─── the native hint line, ported ───────────────────────────────────────────
+//
+// zellij's status-bar plugin sends a one-row pane to one_line_ui(), NOT to the
+// two-line first_line/second_line pair. Everything from here to derived_hints()
+// is a port of that module (default-plugins/status-bar/src/one_line_ui.rs), so
+// the two bars agree hint for hint, word for word and colour for colour:
+//
+//   get_keys_and_hints   the curated per-mode table — WHICH hints, in what
+//                        order, with a long and a short wording for each
+//   action_key & co.     which key each hint gets: an EXACT match on the
+//                        action sequence, so a bind that does not do precisely
+//                        what the table asks for shows no hint at all
+//   keybinds             the width ladder: long names, short names, then as
+//                        many short ones as fit followed by " ... "
+//   add_shortcut         one hint = serialized key text + a ribbon
+//
+// The one segment deliberately left out is render_mode_key_indicators(), the
+// left-hand list of MODE names: it is empty in Tmux mode anyway and the status
+// bar below already carries the mode.
+
+/// What zellij appends when the hints do not fit — its own MORE_MSG, spaces and
+/// all, not an ellipsis.
+const MORE_MSG: &str = " ... ";
+/// Shorthand for the action every mode uses to get back out.
+const TO_NORMAL: Action = Action::SwitchToMode { input_mode: InputMode::Normal };
+
+/// Every key bound to EXACTLY this sequence of actions.
+///
+/// Exact is the operative word, and it is why the native bar hides hints one
+/// might expect: its "Rename tab" wants `SwitchToMode(RenameTab)` followed by
+/// `TabNameInput`, so a bind that only switches the mode matches nothing and
+/// the hint is dropped. We drop it too.
+fn action_key(keymap: &[(KeyWithModifier, Vec<Action>)], action: &[Action]) -> Vec<KeyWithModifier> {
+    keymap
+        .iter()
+        .filter_map(|(key, acvec)| {
+            let matching = acvec.iter().zip(action).filter(|(a, b)| a.shallow_eq(b)).count();
+            (matching == acvec.len() && matching == action.len()).then(|| key.clone())
+        })
+        .collect()
 }
 
-impl Hint {
-    // The key to show when there is room for only one: the shortest, which
-    // picks the plain letter over "Ctrl+..." and over an arrow key.
-    fn best_key(&self) -> &str {
-        self.keys
-            .iter()
-            .min_by_key(|key| key.chars().count())
-            .map(String::as_str)
-            .unwrap_or("")
+/// The keys for several action sequences at once — how one hint comes to carry
+/// a whole group, as in `h|j|k|l` for "Move focus".
+fn action_key_group(
+    keymap: &[(KeyWithModifier, Vec<Action>)],
+    actions: &[&[Action]],
+) -> Vec<KeyWithModifier> {
+    actions.iter().flat_map(|action| action_key(keymap, action)).collect()
+}
+
+/// The first key whose FIRST action is this one — looser than action_key, and
+/// used where zellij wants one key rather than the whole matching set.
+fn single_action_key(
+    keymap: &[(KeyWithModifier, Vec<Action>)],
+    action: &[Action],
+) -> Vec<KeyWithModifier> {
+    keymap
+        .iter()
+        .find(|(_, acvec)| acvec.first() == action.first())
+        .map(|(key, _)| vec![key.clone()])
+        .unwrap_or_default()
+}
+
+/// The first key that launches the named plugin (the Session mode entries).
+fn plugin_key(keymap: &[(KeyWithModifier, Vec<Action>)], url: &str) -> Vec<KeyWithModifier> {
+    keymap
+        .iter()
+        .find(|(_, acvec)| acvec.iter().any(|a| a.launches_plugin(url)))
+        .map(|(key, _)| vec![key.clone()])
+        .unwrap_or_default()
+}
+
+/// The current mode's binds, sorted by key and deduplicated by what they DO, so
+/// that when several keys run the same actions the first one wins. zellij does
+/// this before consulting the table; the order of the surviving keys is what
+/// decides which key each hint ends up showing.
+fn deduped_keymap(mode_info: &ModeInfo) -> Vec<(KeyWithModifier, Vec<Action>)> {
+    let mut keymap = mode_info.get_mode_keybinds();
+    keymap.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut seen: Vec<Vec<Action>> = Vec::new();
+    let mut out = Vec::new();
+    for (key, actions) in keymap {
+        if seen.contains(&actions) {
+            continue;
+        }
+        seen.push(actions.clone());
+        out.push((key, actions));
+    }
+    out
+}
+
+/// The way back to the base mode, preferring Enter — computed BEFORE the dedupe
+/// above, exactly as zellij does, because the dedupe would otherwise collapse
+/// the several keys that all just leave the mode.
+fn to_base_mode_key(mode_info: &ModeInfo) -> Vec<KeyWithModifier> {
+    let keymap = mode_info.get_mode_keybinds();
+    let target = mode_info.base_mode.unwrap_or(InputMode::Normal);
+    let keys = action_key(&keymap, &[Action::SwitchToMode { input_mode: target }]);
+    if keys.contains(&KeyWithModifier::new(BareKey::Enter)) {
+        vec![KeyWithModifier::new(BareKey::Enter)]
+    } else {
+        keys.into_iter().take(1).collect()
     }
 }
 
-/// How much of a hint survives — the rungs the hints bar climbs down when the
-/// terminal is too narrow for the fullest rendering, the way the native bar
-/// does it rather than amputating the tail of a single rendering.
-#[derive(Clone, Copy, PartialEq)]
-enum Level {
-    /// Every key that does the job: `h/j/k/l` `Move focus`.
-    AllKeys,
-    /// One key per hint: `h` `Move focus`.
-    OneKey,
+/// A NewTab action to match against. Every field is ignored — Action::shallow_eq
+/// treats any two NewTab as equal — so the values here are only ballast.
+fn any_new_tab() -> Action {
+    Action::NewTab {
+        tiled_layout: None,
+        floating_layouts: vec![],
+        swap_tiled_layouts: None,
+        swap_floating_layouts: None,
+        tab_name: None,
+        should_change_focus_to_new_tab: true,
+        cwd: None,
+        initial_panes: None,
+        first_pane_unblock_condition: None,
+    }
 }
 
-// The wording never shrinks — zellij's own words are the point of the bar, and
-// "Down" in place of "Split down" reads as a different bar. Width buys fewer
-// keys and then fewer hints, never abbreviations.
+/// zellij's own table: for the current mode, which hints to show, in which
+/// order, with the long and the short wording, and the keys that earn each one.
+/// Empty for Normal and Locked — see render_hints().
+#[rustfmt::skip]
+fn get_keys_and_hints(mi: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier>)> {
+    use Action as A;
+    use Direction as Dir;
+    use InputMode as IM;
 
-/// The order zellij's own bar puts its hints in, extended with the rest of what
-/// we can label. Anything not listed keeps its place in the config, after these
-/// — so when the line has to be cut, what goes is what matters least.
-const HINT_ORDER: &[&str] = &[
-    // The head follows zellij's own tmux-mode line, hint for hint.
-    "Move focus",
-    "Split down",
-    "Split right",
-    "Split left",
-    "Split up",
-    "New Pane",
-    "Fullscreen",
-    "New tab",
-    "Close",
-    "Rename tab",
-    "Rename pane",
-    "Previous Tab",
-    "Next Tab",
-    "Select pane",
-    // Then the rest of what we can label, most-reached-for first.
-    "Toggle Floating",
-    "Toggle Embed",
-    "New Floating",
-    "Stack",
-    "Increase/Decrease size",
-    "Move pane",
-    "Move tab",
-    "Toggle",
-    "Detach",
-    "Quit",
-    "Scroll",
-    "Enter search term",
-    "Search down",
-    "Search up",
-    "Case sensitive",
-    "Whole words",
-    "Edit scrollback in default editor",
-    "Break pane to new tab",
-    "Break pane left/right",
-    "Switch Location",
-    "Sync",
-    "Frames",
-    "Pin",
-    "Copy",
-    "Clear",
-    "Run",
-    "Plugin Manager",
-];
+    let km = deduped_keymap(mi);
+    let to_base = to_base_mode_key(mi);
+    let s = |text: &str| text.to_string();
 
-// The current mode's keybinds, grouped by what they DO: one hint per label — so
-// the six keys that scroll become a single "j|k|Ctrl f|Ctrl b|d|u Scroll", the
-// way zellij groups them — then ordered by HINT_ORDER.
-fn hint_groups(mode_info: &ModeInfo) -> Vec<Hint> {
-    let mut hints: Vec<Hint> = Vec::new();
+    if mi.mode == IM::Pane { vec![
+        (s("New"), s("New"), single_action_key(&km, &[A::NewPane { direction: None, pane_name: None, start_suppressed: false }, TO_NORMAL])),
+        (s("Change Focus"), s("Move"), action_key_group(&km, &[
+            &[A::MoveFocus { direction: Dir::Left }], &[A::MoveFocus { direction: Dir::Down }],
+            &[A::MoveFocus { direction: Dir::Up }], &[A::MoveFocus { direction: Dir::Right }]])),
+        (s("Close"), s("Close"), single_action_key(&km, &[A::CloseFocus, TO_NORMAL])),
+        (s("Rename"), s("Rename"), single_action_key(&km, &[A::SwitchToMode { input_mode: IM::RenamePane }, A::PaneNameInput { input: vec![0] }])),
+        (s("Toggle Fullscreen"), s("Fullscreen"), single_action_key(&km, &[A::ToggleFocusFullscreen, TO_NORMAL])),
+        (s("Toggle Floating"), s("Floating"), single_action_key(&km, &[A::ToggleFloatingPanes, TO_NORMAL])),
+        (s("Toggle Embed"), s("Embed"), single_action_key(&km, &[A::TogglePaneEmbedOrFloating, TO_NORMAL])),
+        (s("Split Right"), s("Right"), single_action_key(&km, &[A::NewPane { direction: Some(Dir::Right), pane_name: None, start_suppressed: false }, TO_NORMAL])),
+        (s("Split Down"), s("Down"), single_action_key(&km, &[A::NewPane { direction: Some(Dir::Down), pane_name: None, start_suppressed: false }, TO_NORMAL])),
+        (s("Stack"), s("Stack"), single_action_key(&km, &[A::NewStackedPane { command: None, pane_name: None, near_current_pane: false, tab_id: None }, TO_NORMAL])),
+        (s("Select pane"), s("Select"), to_base),
+    ]} else if mi.mode == IM::Tab {
+        // The default bindings put all four arrows on tab focus, and the dedupe
+        // above would leave Left and Down. zellij special-cases it back to the
+        // pair a reader expects; so do we.
+        let raw = mi.get_mode_keybinds();
+        let full = action_key_group(&raw, &[&[A::GoToPreviousTab], &[A::GoToNextTab]]);
+        let focus_keys = if full.contains(&KeyWithModifier::new(BareKey::Left))
+            && full.contains(&KeyWithModifier::new(BareKey::Right)) {
+            vec![KeyWithModifier::new(BareKey::Left), KeyWithModifier::new(BareKey::Right)]
+        } else {
+            action_key_group(&km, &[&[A::GoToPreviousTab], &[A::GoToNextTab]])
+        };
+        vec![
+        (s("New"), s("New"), single_action_key(&km, &[any_new_tab(), TO_NORMAL])),
+        (s("Change focus"), s("Move"), focus_keys),
+        (s("Close"), s("Close"), single_action_key(&km, &[A::CloseTab, TO_NORMAL])),
+        (s("Rename"), s("Rename"), single_action_key(&km, &[A::SwitchToMode { input_mode: IM::RenameTab }, A::TabNameInput { input: vec![0] }])),
+        (s("Sync"), s("Sync"), single_action_key(&km, &[A::ToggleActiveSyncTab, TO_NORMAL])),
+        (s("Break pane to new tab"), s("Break out"), single_action_key(&km, &[A::BreakPane, TO_NORMAL])),
+        (s("Break pane left/right"), s("Break"), action_key_group(&km, &[
+            &[A::BreakPaneLeft, TO_NORMAL], &[A::BreakPaneRight, TO_NORMAL]])),
+        (s("Toggle"), s("Toggle"), single_action_key(&km, &[A::ToggleTab])),
+        (s("Select pane"), s("Select"), to_base),
+    ]} else if mi.mode == IM::Resize { vec![
+        (s("Increase/Decrease size"), s("Increase/Decrease"), action_key_group(&km, &[
+            &[A::Resize { resize: Resize::Increase, direction: None }],
+            &[A::Resize { resize: Resize::Decrease, direction: None }]])),
+        (s("Increase to"), s("Increase"), action_key_group(&km, &[
+            &[A::Resize { resize: Resize::Increase, direction: Some(Dir::Left) }],
+            &[A::Resize { resize: Resize::Increase, direction: Some(Dir::Down) }],
+            &[A::Resize { resize: Resize::Increase, direction: Some(Dir::Up) }],
+            &[A::Resize { resize: Resize::Increase, direction: Some(Dir::Right) }]])),
+        (s("Decrease from"), s("Decrease"), action_key_group(&km, &[
+            &[A::Resize { resize: Resize::Decrease, direction: Some(Dir::Left) }],
+            &[A::Resize { resize: Resize::Decrease, direction: Some(Dir::Down) }],
+            &[A::Resize { resize: Resize::Decrease, direction: Some(Dir::Up) }],
+            &[A::Resize { resize: Resize::Decrease, direction: Some(Dir::Right) }]])),
+        (s("Select pane"), s("Select"), to_base),
+    ]} else if mi.mode == IM::Move { vec![
+        (s("Switch Location"), s("Move"), action_key_group(&km, &[
+            &[A::MovePane { direction: Some(Dir::Left) }], &[A::MovePane { direction: Some(Dir::Down) }],
+            &[A::MovePane { direction: Some(Dir::Up) }], &[A::MovePane { direction: Some(Dir::Right) }]])),
+        (s("When done"), s("Back"), to_base),
+    ]} else if mi.mode == IM::Scroll { vec![
+        (s("Enter search term"), s("Search"), action_key(&km, &[A::SwitchToMode { input_mode: IM::EnterSearch }, A::SearchInput { input: vec![0] }])),
+        (s("Scroll"), s("Scroll"), action_key_group(&km, &[
+            &[A::ScrollDown], &[A::ScrollUp],
+            &[A::PageScrollDown], &[A::PageScrollUp],
+            &[A::HalfPageScrollDown], &[A::HalfPageScrollUp]])),
+        (s("Edit scrollback in default editor"), s("Edit"), single_action_key(&km, &[A::EditScrollback { ansi: false }, TO_NORMAL])),
+        (s("Select pane"), s("Select"), to_base),
+        // zellij's table ends with a "Scroll commands" entry for
+        // ScrollToPreviousPrompt/ScrollToNextPrompt; zellij-tile 0.44.3 has no
+        // such actions, so we cannot express it. It only shows when those are
+        // bound, and then it would come last anyway.
+    ]} else if mi.mode == IM::EnterSearch { vec![
+        (s("When done"), s("Done"), action_key(&km, &[A::SwitchToMode { input_mode: IM::Search }])),
+        (s("Cancel"), s("Cancel"), action_key(&km, &[A::SearchInput { input: vec![27] }, A::SwitchToMode { input_mode: IM::Scroll }])),
+    ]} else if mi.mode == IM::Search { vec![
+        (s("Enter Search term"), s("Search"), action_key(&km, &[A::SwitchToMode { input_mode: IM::EnterSearch }, A::SearchInput { input: vec![0] }])),
+        (s("Scroll"), s("Scroll"), action_key_group(&km, &[&[A::ScrollDown], &[A::ScrollUp]])),
+        (s("Scroll page"), s("Scroll"), action_key_group(&km, &[&[A::PageScrollDown], &[A::PageScrollUp]])),
+        (s("Scroll half page"), s("Scroll"), action_key_group(&km, &[&[A::HalfPageScrollDown], &[A::HalfPageScrollUp]])),
+        (s("Search down"), s("Down"), action_key(&km, &[A::Search { direction: SearchDirection::Down }])),
+        (s("Search up"), s("Up"), action_key(&km, &[A::Search { direction: SearchDirection::Up }])),
+        (s("Case sensitive"), s("Case"), action_key(&km, &[A::SearchToggleOption { option: SearchOption::CaseSensitivity }])),
+        (s("Wrap"), s("Wrap"), action_key(&km, &[A::SearchToggleOption { option: SearchOption::Wrap }])),
+        (s("Whole words"), s("Whole"), action_key(&km, &[A::SearchToggleOption { option: SearchOption::WholeWord }])),
+    ]} else if mi.mode == IM::Session { vec![
+        (s("Detach"), s("Detach"), action_key(&km, &[A::Detach])),
+        (s("Session Manager"), s("Manager"), plugin_key(&km, "session-manager")),
+        (s("Share"), s("Share"), plugin_key(&km, "zellij:share")),
+        (s("Configure"), s("Config"), plugin_key(&km, "configuration")),
+        (s("Layout Manager"), s("Layouts"), plugin_key(&km, "zellij:layout-manager")),
+        (s("Plugin Manager"), s("Plugins"), plugin_key(&km, "plugin-manager")),
+        (s("About"), s("About"), plugin_key(&km, "zellij:about")),
+        (s("Select pane"), s("Select"), to_base),
+    ]} else if mi.mode == IM::Tmux { vec![
+        (s("Move focus"), s("Move"), action_key_group(&km, &[
+            &[A::MoveFocus { direction: Dir::Left }], &[A::MoveFocus { direction: Dir::Down }],
+            &[A::MoveFocus { direction: Dir::Up }], &[A::MoveFocus { direction: Dir::Right }]])),
+        (s("Split down"), s("Down"), action_key(&km, &[A::NewPane { direction: Some(Dir::Down), pane_name: None, start_suppressed: false }, TO_NORMAL])),
+        (s("Split right"), s("Right"), action_key(&km, &[A::NewPane { direction: Some(Dir::Right), pane_name: None, start_suppressed: false }, TO_NORMAL])),
+        (s("Fullscreen"), s("Fullscreen"), action_key(&km, &[A::ToggleFocusFullscreen, TO_NORMAL])),
+        (s("New tab"), s("New"), action_key(&km, &[any_new_tab(), TO_NORMAL])),
+        (s("Rename tab"), s("Rename"), action_key(&km, &[A::SwitchToMode { input_mode: IM::RenameTab }, A::TabNameInput { input: vec![0] }])),
+        (s("Previous Tab"), s("Previous"), action_key(&km, &[A::GoToPreviousTab, TO_NORMAL])),
+        (s("Next Tab"), s("Next"), action_key(&km, &[A::GoToNextTab, TO_NORMAL])),
+        (s("Select pane"), s("Select"), to_base),
+    ]} else if matches!(mi.mode, IM::RenamePane | IM::RenameTab) { vec![
+        (s("When done"), s("Done"), to_base),
+    ]} else { vec![] }
+}
+
+/// Normal and Locked, where zellij's table is empty: every bind we can name,
+/// grouped by what it does, in the order the configuration lists them. The
+/// wording does not shrink here — there is no second, shorter name to fall back
+/// to — so the ladder below goes straight to cutting.
+fn derived_hints(mode_info: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier>)> {
+    let mut hints: Vec<(String, String, Vec<KeyWithModifier>)> = Vec::new();
     for (key, actions) in mode_info.get_mode_keybinds() {
         let Some(label) = action_label(&actions, mode_info.mode) else {
             continue;
         };
-        let key = key.to_string();
-        match hints.iter_mut().find(|hint| hint.label == label) {
-            Some(hint) => {
-                // Every key, however many: zellij prints all six of
-                // "j|k|Ctrl f|Ctrl b|d|u" and the width ladder handles the rest.
-                if !hint.keys.contains(&key) {
-                    hint.keys.push(key);
+        match hints.iter_mut().find(|(long, _, _)| *long == label) {
+            Some((_, _, keys)) => {
+                if !keys.contains(&key) {
+                    keys.push(key);
                 }
             }
-            None => hints.push(Hint { label, keys: vec![key] }),
+            None => hints.push((label.clone(), label, vec![key])),
         }
     }
-    // Stable, so hints sharing a rank (and everything unlisted) keep the order
-    // they have in the config.
-    hints.sort_by_key(|hint| {
-        HINT_ORDER
-            .iter()
-            .position(|known| *known == hint.label)
-            .unwrap_or(HINT_ORDER.len())
-    });
     hints
 }
+
+/// The three rungs zellij climbs down when the line will not fit: every hint
+/// under its full name, then every hint under its short name, then as many
+/// short ones as fit with " ... " standing in for the rest.
+fn keybinds(
+    mode_info: &ModeInfo,
+    hints: &[(String, String, Vec<KeyWithModifier>)],
+    max_width: usize,
+) -> (String, usize) {
+    let full = shortcut_list(mode_info, hints, false);
+    if full.1 <= max_width {
+        return full;
+    }
+    let short = shortcut_list(mode_info, hints, true);
+    if short.1 <= max_width {
+        return short;
+    }
+    best_effort_shortcut_list(mode_info, hints, max_width)
+}
+
+fn shortcut_list(
+    mode_info: &ModeInfo,
+    hints: &[(String, String, Vec<KeyWithModifier>)],
+    short: bool,
+) -> (String, usize) {
+    let mut part = String::new();
+    let mut len = 0;
+    for (long, brief, keys) in hints {
+        let (piece, piece_len) = add_shortcut(mode_info, if short { brief } else { long }, keys);
+        part.push_str(&piece);
+        len += piece_len;
+    }
+    (part, len)
+}
+
+fn best_effort_shortcut_list(
+    mode_info: &ModeInfo,
+    hints: &[(String, String, Vec<KeyWithModifier>)],
+    max_len: usize,
+) -> (String, usize) {
+    let mut part = String::new();
+    let mut len = 0;
+    for (_, brief, keys) in hints {
+        let (piece, piece_len) = add_shortcut(mode_info, brief, keys);
+        if len + piece_len + MORE_MSG.chars().count() > max_len {
+            part.push_str(MORE_MSG);
+            len += MORE_MSG.chars().count();
+            break;
+        }
+        part.push_str(&piece);
+        len += piece_len;
+    }
+    (part, len)
+}
+
+/// One hint: a KEY box in the theme's yellow, then — square edge to square edge
+/// — a box naming what the key does, then a gap.
+///
+/// zellij draws these as ribbons, which arrive with powerline arrows on both
+/// ends. We paint them by hand instead: straight edges, and the key in
+/// `multiplayer_user_colors.player_8`, which is where the lvim colorschemes put
+/// their yellow (see mode_colour() on why the accents come from the RAW palette
+/// and not from the contrast-flattened text_unselected fields).
+fn add_shortcut(mode_info: &ModeInfo, text: &str, keys: &[KeyWithModifier]) -> (String, usize) {
+    if keys.is_empty() {
+        return (String::new(), 0);
+    }
+    let colors = mode_info.style.colors;
+    let bar_bg = colors.text_unselected.background;
+    let (key_text, key_len) = key_label(keys);
+
+    let mut part = pill(&format!(" {} ", key_text), colors.multiplayer_user_colors.player_8, bar_bg);
+    part.push_str(&pill(
+        &format!(" {} ", text),
+        colors.ribbon_unselected.base,
+        colors.ribbon_unselected.background,
+    ));
+    part.push_str(&fmt(colors.text_unselected.base, bar_bg));
+    part.push(' ');
+    // both paddings, both boxes and the gap after them
+    (part, key_len + text.chars().count() + 5)
+}
+
+/// The keys of one hint, in zellij's own wording: `h|j|k|l` normally, `hjkl`
+/// (and the other run-on groups) without separators, and a shared modifier
+/// lifted out in front as `Ctrl <p|n>`.
+fn key_label(keys: &[KeyWithModifier]) -> (String, usize) {
+    if keys.is_empty() {
+        return (String::new(), 0);
+    }
+    let common = common_modifiers(keys);
+    let no_common_modifier = common.is_empty();
+    let modifier_str = common.iter().map(|m| m.to_string()).collect::<Vec<_>>().join("-");
+
+    let rendered: Vec<String> = keys
+        .iter()
+        .map(|key| {
+            if no_common_modifier || keys.len() == 1 {
+                key.to_string()
+            } else {
+                key.strip_common_modifiers(&common).to_string()
+            }
+        })
+        .collect();
+
+    // The groups zellij runs together, because "hjkl" reads as one thing and
+    // "h|j|k|l" does not.
+    let separator = match rendered.join("").as_str() {
+        "HJKL" | "hjkl" | "←↓↑→" | "←→" | "↓↑" | "[]" => "",
+        _ => "|",
+    };
+
+    let text = if no_common_modifier || rendered.len() == 1 {
+        rendered.join(separator)
+    } else {
+        format!("{} <{}>", modifier_str, rendered.join(separator))
+    };
+    let len = text.chars().count();
+    (text, len)
+}
+
+/// The modifiers every key in the group shares — what gets lifted out in front.
+fn common_modifiers(keys: &[KeyWithModifier]) -> Vec<KeyModifier> {
+    let Some((last, rest)) = keys.split_last() else {
+        return vec![];
+    };
+    let mut common = last.key_modifiers.clone();
+    for key in rest {
+        common = common.intersection(&key.key_modifiers).cloned().collect();
+    }
+    common.into_iter().collect()
+}
+
+/// The word for what is being typed, in the modes that swallow your typing —
+/// zellij carries it on the front of its keygroup separator; we draw it as a box
+/// like the rest, since the separator itself is gone.
+fn mode_help_box(mode_info: &ModeInfo) -> (String, usize) {
+    let text = match mode_info.mode {
+        InputMode::RenamePane => "RENAMING PANE",
+        InputMode::RenameTab => "RENAMING TAB",
+        InputMode::EnterSearch => "ENTERING SEARCH TERM",
+        InputMode::Search => "SEARCHING",
+        _ => return (String::new(), 0),
+    };
+    let colors = mode_info.style.colors;
+    let mut part = pill(
+        &format!(" {} ", text),
+        colors.text_unselected.emphasis_0,
+        colors.text_unselected.background,
+    );
+    part.push(' ');
+    (part, text.chars().count() + 3)
+}
+
 
 // One bind may carry several actions; the first one that has a name gives the
 // hint its label.
