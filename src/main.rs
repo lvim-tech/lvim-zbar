@@ -107,6 +107,21 @@ struct State {
     // to compute the same next value for the idempotent toggle broadcast.
     // Hidden rather than visible, so the derived Default (false) means "shown".
     hints_hidden: bool,
+    // Where each tab landed on the last paint, so a click can be turned back
+    // into a tab. Written by render, read by the click handler.
+    tab_hits: Vec<TabHit>,
+}
+
+/// One tab's columns on the drawn bar: `start..end`, and which tab they are.
+///
+/// Columns, not bytes: the bar is one ANSI string in which a tab's label is
+/// surrounded by zero-width escapes, and a click arrives as a column number.
+struct TabHit {
+    start: usize,
+    /// One past the last column the tab occupies.
+    end: usize,
+    /// `TabInfo::position` — 0-based, unlike `switch_tab_to`.
+    position: usize,
 }
 
 /// How many TICK periods a notice stays on the bar (TICK = 2s → ~6 seconds).
@@ -139,14 +154,22 @@ impl ZellijPlugin for State {
             PermissionType::ReadCliPipes,
             PermissionType::MessageAndLaunchOtherPlugins,
         ]);
-        subscribe(&[
+        let mut events = vec![
             EventType::ModeUpdate,
             EventType::TabUpdate,
             EventType::Timer,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
             EventType::InterceptedKeyPress,
-        ]);
+        ];
+        // Only the bar that draws tabs has anything to click. The subscription
+        // is narrowed rather than filtered in the handler because Mouse covers
+        // Hover too, which fires on every pointer movement across the pane: the
+        // hints bar would be woken for nothing, once per mouse move.
+        if self.role == Role::Status {
+            events.push(EventType::Mouse);
+        }
+        subscribe(&events);
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -220,6 +243,17 @@ impl ZellijPlugin for State {
                 true
             }
             Event::InterceptedKeyPress(key) => self.handle_session_edit_key(key),
+            // A click on a tab switches to it. Only LeftClick is answered: the
+            // rest of the Mouse family — Hover above all — arrives for every
+            // pointer movement over the bar and must cost nothing.
+            //
+            // No repaint from here. Switching produces a TabUpdate, which is
+            // what redraws the bar; saying "render" now would paint the old
+            // active tab a second time.
+            Event::Mouse(Mouse::LeftClick(line, col)) => {
+                self.click_tab(line, col);
+                false
+            }
             _ => false,
         }
     }
@@ -352,9 +386,44 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    /// Turn a click on the bar into a tab switch.
+    ///
+    /// The columns come from the last paint, which is the only thing that knows
+    /// where a tab ended up: names change length, a rename turns one into an
+    /// edit field, and the notice zone moves nothing but sits right after them.
+    ///
+    /// Deliberately silent for anything that is not squarely a tab. A status bar
+    /// is not a place where a stray click should do something surprising, and
+    /// there is no visual feedback here to explain what it did.
+    fn click_tab(&self, line: isize, col: usize) {
+        // The bar draws a single row, so anything below it is empty space that
+        // happens to belong to the pane.
+        if line != 0 {
+            return;
+        }
+        // Mid-rename the bar is showing an edit field. zellij's RenameTab mode
+        // edits whichever tab is active, so switching underneath it would leave
+        // the rename pointing at a tab the user never meant to rename — and the
+        // session rename has the keyboard intercepted on top of that. Neither is
+        // worth a click that looks like navigation.
+        if self.session_edit.is_some() || self.mode_info.mode == InputMode::RenameTab {
+            return;
+        }
+        let Some(hit) = self
+            .tab_hits
+            .iter()
+            .find(|hit| col >= hit.start && col < hit.end)
+        else {
+            return;
+        };
+        // `switch_tab_to` counts from 1 (it takes the number in the default tab
+        // names); `TabInfo::position` counts from 0.
+        switch_tab_to(hit.position as u32 + 1);
+    }
+
     // The bar at the bottom: mode pill · session pill · tabs · notice, then the
     // widgets on the right.
-    fn render_status(&self, cols: usize) {
+    fn render_status(&mut self, cols: usize) {
         let c = self.mode_info.style.colors;
         // Accent pills carry dark text on a coloured background, so they want the
         // RAW palette accents — not the contrast-floored versions the zellij
@@ -401,7 +470,14 @@ impl State {
             left.push_str(&pill(&format!(" {} ", session), acc_fg, yellow)); // session (theme yellow)
         }
         left.push_str(&fmt(bar_fg, bar_bg));
+        // Where each tab lands, in columns, so a click can find it again.
+        // Measured off the string being drawn, with the same `visible_width`
+        // that computes this row's padding — so the hit zone and the paint
+        // agree by construction rather than by two calculations happening to
+        // match. Collected locally: `self.tabs` is borrowed by the loop.
+        let mut hits: Vec<TabHit> = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
+            let start = visible_width(&left);
             if tab.active && tab_editing {
                 // Native RenameTab mode: zellij core edits the name and streams
                 // it here via TabUpdate — render it as an inline edit field
@@ -410,6 +486,11 @@ impl State {
                 // "Tab #N": show the display form for that brief moment.
                 left.push_str(&pill(&format!(" {}_ ", tab_display_name(tab)), acc_fg, edit_bg));
                 left.push_str(&fmt(bar_fg, bar_bg));
+                hits.push(TabHit {
+                    start,
+                    end: visible_width(&left),
+                    position: tab.position,
+                });
                 continue;
             }
             let label = format!(" {} ", tab_display_name(tab));
@@ -423,7 +504,13 @@ impl State {
                 left.push_str(&label);
                 left.push_str(&fmt(bar_fg, bar_bg));
             }
+            hits.push(TabHit {
+                start,
+                end: visible_width(&left),
+                position: tab.position,
+            });
         }
+        self.tab_hits = hits;
 
         // ── the notice zone: a transient system message next to the tabs ────
         // Plain coloured text (the theme's cyan) on the bar background — a pill would shout; a

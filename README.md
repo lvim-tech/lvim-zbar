@@ -14,6 +14,21 @@ a theme switch too), so the bar repaints live and follows whatever theme the ses
 is no per-theme regeneration of anything, unlike a bar whose colours are baked into the layout at
 session start.
 
+## Clicking a tab
+
+A left click on a tab switches to it. The bar records where each tab landed as it draws — the same
+`visible_width` that lays out the row — so the clickable zone and the paint cannot drift apart:
+names change length, a rename turns the active one into an edit field, and the hit zones move with
+them.
+
+Only a left click on a tab does anything. A click on the mode or session pill, on the notice, on
+the widgets or on empty bar is silently ignored, and so is every click while a rename is in
+progress: zellij's RenameTab mode edits whichever tab is *active*, so switching underneath it would
+leave the rename pointing at a tab you never meant to rename.
+
+Only the status bar subscribes to mouse events. `Mouse` covers `Hover`, which fires on every
+pointer movement across the pane, and the hints bar has nothing to click.
+
 ## Inline rename
 
 - **Tab rename** is fully native: the `r` keybind (in zellij's tmux mode here) enters the RenameTab
