@@ -87,6 +87,12 @@ struct State {
     mem: String,
     online: String,
     clock: String,
+    // The fleet of Claude Code agents, as lvim-zclaude counts it: the prose line it broadcasts
+    // (`3 agents · 1 busy · 1 waiting`) and whether any of them is waiting for a person. It
+    // arrives as the `lvim-zclaude-summary` pipe; nothing is polled and nothing is read from
+    // disk, so a machine without that plugin simply never shows the field.
+    claude: String,
+    claude_waiting: bool,
     permitted: bool,
     // Some(buffer) while an inline session rename is in progress. Every
     // instance keeps a mirror of the buffer; the key-owning instance is the
@@ -327,6 +333,29 @@ impl ZellijPlugin for State {
                     }
                 }
             }
+            // The fleet of agents, broadcast by lvim-zclaude whenever its count changes (it sends
+            // `zellij pipe --name lvim-zclaude-summary` with two lines: the prose for a bar, and
+            // `agents=N busy=N waiting=N done=N idle=N` for anything that would rather parse).
+            // The bar is TOLD; it never polls, never reads `~/.claude`, and knows nothing when the
+            // board is not running — which is exactly what an absent field should mean.
+            "lvim-zclaude-summary" => {
+                if self.role != Role::Status {
+                    return false;
+                }
+                let Some(text) = message.payload else { return false };
+                let prose = text.lines().next().unwrap_or("").trim().to_string();
+                let pairs = text.lines().nth(1).unwrap_or("");
+                let waiting = field_count(pairs, "waiting") > 0 || field_count(pairs, "done") > 0;
+                // "0 agents" is nothing to show: the field disappears rather than reading zero.
+                let prose = if prose.starts_with("0 agent") { String::new() } else { prose };
+                let changed = prose != self.claude || waiting != self.claude_waiting;
+                if changed {
+                    eprintln!("lvim-zbar: claude {} (waiting {})", prose, waiting);
+                }
+                self.claude = prose;
+                self.claude_waiting = waiting;
+                changed
+            }
             // The toggle keybind (`MessagePlugin ... { name "hints_toggle"; }`).
             // It is url-addressed, so it lands on every STATUS instance — one
             // per tab. Nobody flips anything here: each recipient computes the
@@ -521,8 +550,15 @@ impl State {
             left.push_str(&fmt(bar_fg, bar_bg));
         }
 
-        // ── right: CPU · MEM · online · clock ───────────────────────────────
+        // ── right: agents · CPU · MEM · online · clock ──────────────────────
         let mut right = String::new();
+        // The agents lead the right side: a machine's load is background, but an agent waiting
+        // for an answer is the one thing on this bar that is waiting for THIS person. Red is
+        // that wait; otherwise the field is as quiet as CPU.
+        if !self.claude.is_empty() {
+            right.push_str(&fmt(if self.claude_waiting { red } else { teal }, bar_bg));
+            right.push_str(&format!(" ✳ {} ", self.claude));
+        }
         if !self.cpu.is_empty() {
             // Blue while healthy, red past the warning threshold.
             let warn = percent(&self.cpu).map_or(false, |p| p >= CPU_WARN_PERCENT);
@@ -1344,6 +1380,20 @@ fn visible_width(s: &str) -> usize {
         }
     }
     w
+}
+
+/// `agents=3 busy=1 waiting=1 done=0 idle=1` → the number after one of those names, or 0.
+///
+/// A line of `key=value` pairs rather than JSON, so this stays a `split_whitespace` and the bar
+/// carries no parser. An unknown name, a missing line or a value that is not a number all read as
+/// nothing to show — a broadcast from a newer lvim-zclaude must never blank the bar.
+fn field_count(pairs: &str, name: &str) -> u32 {
+    pairs
+        .split_whitespace()
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(0)
 }
 
 /// "37%" → 37 (what cpu.sh prints).
