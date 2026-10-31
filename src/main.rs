@@ -932,7 +932,7 @@ fn get_keys_and_hints(mi: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier
         (s("Toggle Embed"), s("Embed"), single_action_key(&km, &[A::TogglePaneEmbedOrFloating, TO_NORMAL])),
         (s("Split Right"), s("Right"), single_action_key(&km, &[A::NewPane { direction: Some(Dir::Right), pane_name: None, start_suppressed: false }, TO_NORMAL])),
         (s("Split Down"), s("Down"), single_action_key(&km, &[A::NewPane { direction: Some(Dir::Down), pane_name: None, start_suppressed: false }, TO_NORMAL])),
-        (s("Stack"), s("Stack"), single_action_key(&km, &[A::NewStackedPane { command: None, pane_name: None, near_current_pane: false, tab_id: None }, TO_NORMAL])),
+        (s("Stack"), s("Stack"), single_action_key(&km, &[A::NewStackedPane { command: None, pane_name: None, near_current_pane: false, no_focus: false, tab_id: None }, TO_NORMAL])),
         (s("Select pane"), s("Select"), to_base),
     ]} else if mi.mode == IM::Tab {
         // The default bindings put all four arrows on tab focus, and the dedupe

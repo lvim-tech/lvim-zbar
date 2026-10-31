@@ -6,7 +6,7 @@ authors = ["lvim-tech"]
 description = "Theme-following zellij status bar plugin"
 
 [dependencies]
-zellij-tile = "0.44.3"
+zellij-tile = "0.45.1"
 
 [profile.release]
 lto = true
