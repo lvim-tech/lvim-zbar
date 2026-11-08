@@ -858,6 +858,42 @@ fn plugin_key(keymap: &[(KeyWithModifier, Vec<Action>)], url: &str) -> Vec<KeyWi
         .unwrap_or_default()
 }
 
+/// Every key of the mode that launches a plugin whose location contains `needle` — all of them,
+/// not the first, so two keys bound to one panel (lvim-zsession's `m` and `s`) both show.
+fn plugin_keys_containing(mi: &ModeInfo, needle: &str) -> Vec<KeyWithModifier> {
+    let mut keys: Vec<KeyWithModifier> = mi
+        .get_mode_keybinds()
+        .into_iter()
+        .filter(|(_, actions)| {
+            actions.iter().any(|a| match a {
+                Action::LaunchOrFocusPlugin { plugin, .. } | Action::LaunchPlugin { plugin, .. } => {
+                    plugin.location_string().contains(needle)
+                }
+                _ => false,
+            })
+        })
+        .map(|(key, _)| key)
+        .collect();
+    keys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    keys
+}
+
+/// `key` when the mode binds it to a keybind pipe (a `MessagePlugin`), else nothing.
+///
+/// **The pipe cannot be told by its name**: the keybinds zellij hands a plugin in `ModeInfo`
+/// carry `KeybindPipe` with every field emptied — `name`, `plugin`, `payload` all `None`
+/// (measured on 0.46.0, 2026-11-08). So a pipe bind is recognised by the key the configuration
+/// gives it; move the bind and this hint goes quiet rather than mislabelling another key.
+fn pipe_key(mi: &ModeInfo, key: KeyWithModifier) -> Vec<KeyWithModifier> {
+    mi.get_mode_keybinds()
+        .into_iter()
+        .filter(|(k, actions)| {
+            *k == key && actions.iter().any(|a| matches!(a, Action::KeybindPipe { .. }))
+        })
+        .map(|(k, _)| k)
+        .collect()
+}
+
 /// The current mode's binds, sorted by key and deduplicated by what they DO, so
 /// that when several keys run the same actions the first one wins. zellij does
 /// this before consulting the table; the order of the surviving keys is what
@@ -1022,6 +1058,10 @@ fn get_keys_and_hints(mi: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier
         (s("Rename tab"), s("Rename"), action_key(&km, &[A::SwitchToMode { input_mode: IM::RenameTab }, A::TabNameInput { input: vec![0] }])),
         (s("Previous Tab"), s("Previous"), action_key(&km, &[A::GoToPreviousTab, TO_NORMAL])),
         (s("Next Tab"), s("Next"), action_key(&km, &[A::GoToNextTab, TO_NORMAL])),
+        // Not in zellij's table: lvim-zsession's session panel and its session restart.
+        (s("Sessions"), s("Sessions"), plugin_keys_containing(mi, "lvim-zsession")),
+        // `Ctrl r` → lvim-zsession's `restart` pipe (config.kdl); see pipe_key().
+        (s("Restart session"), s("Restart"), pipe_key(mi, KeyWithModifier::new(BareKey::Char('r')).with_ctrl_modifier())),
         (s("Select pane"), s("Select"), to_base),
     ]} else if matches!(mi.mode, IM::RenamePane | IM::RenameTab) { vec![
         (s("When done"), s("Done"), to_base),
