@@ -186,6 +186,12 @@ the `RunCommands` permission and refreshed on a timer. Copy them to `~/.config/z
 Note: the scripts directory is currently a compile-time constant (`SCRIPTS` in `src/main.rs`) —
 adjust it to your `$HOME` before building.
 
+In front of them, when there is something to say: what zellij's own attention tracker
+(`GlobalAttentionUpdate`) holds across all sessions **outside the Claude agents** — `● 1` a
+program that needs you, `✗ 2` failed, `✓ 1` done — red while anything needs you or failed.
+Panes that report `app=claude` (lvim-zclaude's hook does) are left out: the `✳` field next to it
+already counts them. Needs zellij built from `main` at or after `644d78c` (2026-11-10).
+
 ## Building
 
 ```sh

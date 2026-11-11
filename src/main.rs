@@ -93,6 +93,11 @@ struct State {
     // disk, so a machine without that plugin simply never shows the field.
     claude: String,
     claude_waiting: bool,
+    // What zellij's own attention tracker says is waiting outside the agents, in any session: a
+    // command that failed, one that finished, a program that asks (`● 1 · ✗ 1 · ✓ 2`). The
+    // agents are left out — lvim-zclaude counts those, and they would be counted twice.
+    attention: String,
+    attention_urgent: bool,
     permitted: bool,
     // Some(buffer) while an inline session rename is in progress. Every
     // instance keeps a mirror of the buffer; the key-owning instance is the
@@ -174,12 +179,20 @@ impl ZellijPlugin for State {
         // hints bar would be woken for nothing, once per mouse move.
         if self.role == Role::Status {
             events.push(EventType::Mouse);
+            events.push(EventType::GlobalAttentionUpdate);
         }
         subscribe(&events);
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
+            Event::GlobalAttentionUpdate(global) => {
+                let (text, urgent) = attention_field(&global);
+                let changed = text != self.attention || urgent != self.attention_urgent;
+                self.attention = text;
+                self.attention_urgent = urgent;
+                changed
+            }
             Event::PermissionRequestResult(_) => {
                 if !self.permitted {
                     self.permitted = true;
@@ -555,6 +568,10 @@ impl State {
         // The agents lead the right side: a machine's load is background, but an agent waiting
         // for an answer is the one thing on this bar that is waiting for THIS person. Red is
         // that wait; otherwise the field is as quiet as CPU.
+        if !self.attention.is_empty() {
+            right.push_str(&fmt(if self.attention_urgent { red } else { teal }, bar_bg));
+            right.push_str(&format!(" {} ", self.attention));
+        }
         if !self.claude.is_empty() {
             right.push_str(&fmt(if self.claude_waiting { red } else { teal }, bar_bg));
             right.push_str(&format!(" ✳ {} ", self.claude));
@@ -1420,6 +1437,33 @@ fn visible_width(s: &str) -> usize {
         }
     }
     w
+}
+
+/// zellij's attention outside the agents → `● 1 · ✗ 2 · ✓ 1`, and whether any of it needs a
+/// person (needs you, failed). Muted items and Claude's own panes (`app=claude`, which the
+/// lvim-zclaude hook reports) are not counted; nothing to count is an empty field.
+fn attention_field(global: &GlobalAttention) -> (String, bool) {
+    if global.attention_disabled {
+        return (String::new(), false);
+    }
+    let (mut needs, mut failed, mut done) = (0, 0, 0);
+    for item in global.items.iter().filter(|i| i.is_counted()) {
+        if item.item.attention.detail.app.as_deref() == Some("claude") {
+            continue;
+        }
+        match item.item.attention.status {
+            AttentionStatus::NeedsYou => needs += 1,
+            AttentionStatus::Failed => failed += 1,
+            AttentionStatus::Done => done += 1,
+            _ => {}
+        }
+    }
+    let parts: Vec<String> = [("●", needs), ("✗", failed), ("✓", done)]
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(mark, n)| format!("{mark} {n}"))
+        .collect();
+    (parts.join(" · "), needs + failed > 0)
 }
 
 /// `agents=3 busy=1 waiting=1 done=0 idle=1` → the number after one of those names, or 0.
