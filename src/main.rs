@@ -142,7 +142,13 @@ const NOTICE_TICKS: u8 = 3;
 const CPU_WARN_PERCENT: u32 = 80;
 const MEM_WARN_PERCENT: u32 = 85;
 
-register_plugin!(State);
+// The plugin's entry points are in `host.rs` (the `register_plugin!` macro written out, so the
+// keybinds can be cleaned before the library decodes them).
+mod host;
+
+fn main() {
+    host::main();
+}
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {

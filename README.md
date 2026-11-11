@@ -134,6 +134,14 @@ The one mode zellij's table does not cover is **Normal** (and Locked): there its
 and the mode indicators duplicate the bottom bar's mode pill, so those two keep this plugin's own
 list — every bind it can name — drawn and cut the same way.
 
+### Binds with a layout twin
+
+A bind may carry the key of another keyboard layout next to the Latin one — `bind "v" "э"`, so the
+bind still works with a Cyrillic layout active. The hints name the Latin key only: the bar drops
+every non-ASCII key from the `ModeUpdate` before `zellij-tile` decodes it (`src/host.rs`, the
+`register_plugin!` macro written out). The library would otherwise cut such a key to its low byte
+(`э`, U+044D, became `M`).
+
 ### Toggling it
 
 The toggle is a keybind of your own — the plugin never sees which one, it only knows the pipe:
