@@ -194,11 +194,25 @@ the `RunCommands` permission and refreshed on a timer. Copy them to `~/.config/z
 Note: the scripts directory is currently a compile-time constant (`SCRIPTS` in `src/main.rs`) —
 adjust it to your `$HOME` before building.
 
-In front of them, when there is something to say: what zellij's own attention tracker
-(`GlobalAttentionUpdate`) holds across all sessions **outside the Claude agents** — `● 1` a
-program that needs you, `✗ 2` failed, `✓ 1` done — red while anything needs you or failed.
-Panes that report `app=claude` (lvim-zclaude's hook does) are left out: the `✳` field next to it
-already counts them. Needs zellij built from `main` at or after `644d78c` (2026-11-10).
+In front of them, when there is something to say, two fields from zellij's attention tracker
+(`GlobalAttentionUpdate`, all sessions; zellij `main` at or after `644d78c`):
+
+```
+⚙ ✗ 1 failed · ✓ 1 done   AI ● EXAMS needs you · ◐ 1 working · 1 idle
+```
+
+- **`AI` the Claude agents** — the panes whose program reports `app=claude` (lvim-zclaude's hook
+  does): `● … needs you` (named by its session, or its tab in this one, when it is the only one;
+  counted when more), `✗ failed`, `◐ working`, `✓ done`, and `N idle` for the rest of the agents
+  lvim-zclaude counts. Without a word from zellij it falls back to lvim-zclaude's own line.
+- **`⚙` everything else** that asks for something: a program that needs you, a command that failed
+  or finished in a pane you were not looking at (`✗` / `✓`). zellij knows a shell command only if
+  the shell marks it (OSC 133) and `attention { track_commands true }` is set; a command still
+  running is not shown.
+
+Red is what waits for you or failed, yellow what runs, green what is done. **A click on a field
+goes there**: to the pane — in whatever session — that needs you, else the one that failed, is
+done or works; a click on `AI` with nothing to go to opens lvim-zclaude's board.
 
 ## Building
 

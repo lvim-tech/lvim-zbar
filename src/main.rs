@@ -93,11 +93,17 @@ struct State {
     // disk, so a machine without that plugin simply never shows the field.
     claude: String,
     claude_waiting: bool,
-    // What zellij's own attention tracker says is waiting outside the agents, in any session: a
-    // command that failed, one that finished, a program that asks (`● 1 · ✗ 1 · ✓ 2`). The
-    // agents are left out — lvim-zclaude counts those, and they would be counted twice.
-    attention: String,
-    attention_urgent: bool,
+    // How many agents lvim-zclaude counts in all (`agents=N` of its summary): the field says
+    // `N idle` from it when zellij has nothing counted for any of them.
+    claude_total: u32,
+    // zellij's attention tracker, split in two: the Claude agents (panes whose program reports
+    // `app=claude`, which lvim-zclaude's hook does) and everything else — a command that failed or
+    // finished where you were not looking, a program that asks. `None` until the first
+    // `GlobalAttentionUpdate`, or when attention is off: the agents field then falls back to
+    // lvim-zclaude's prose.
+    spots: Option<Spots>,
+    // Where the two attention fields landed on the last paint (columns), for a click.
+    right_hits: Vec<(usize, usize, Field)>,
     permitted: bool,
     // Some(buffer) while an inline session rename is in progress. Every
     // instance keeps a mirror of the buffer; the key-owning instance is the
@@ -193,10 +199,9 @@ impl ZellijPlugin for State {
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::GlobalAttentionUpdate(global) => {
-                let (text, urgent) = attention_field(&global);
-                let changed = text != self.attention || urgent != self.attention_urgent;
-                self.attention = text;
-                self.attention_urgent = urgent;
+                let spots = (!global.attention_disabled).then(|| Spots::from_global(&global));
+                let changed = spots != self.spots;
+                self.spots = spots;
                 changed
             }
             Event::PermissionRequestResult(_) => {
@@ -276,7 +281,9 @@ impl ZellijPlugin for State {
             // what redraws the bar; saying "render" now would paint the old
             // active tab a second time.
             Event::Mouse(Mouse::LeftClick(line, col)) => {
-                self.click_tab(line, col);
+                if !self.click_field(line, col) {
+                    self.click_tab(line, col);
+                }
                 false
             }
             _ => false,
@@ -367,12 +374,15 @@ impl ZellijPlugin for State {
                 let waiting = field_count(pairs, "waiting") > 0 || field_count(pairs, "done") > 0;
                 // "0 agents" is nothing to show: the field disappears rather than reading zero.
                 let prose = if prose.starts_with("0 agent") { String::new() } else { prose };
-                let changed = prose != self.claude || waiting != self.claude_waiting;
+                let total = field_count(pairs, "agents");
+                let changed =
+                    prose != self.claude || waiting != self.claude_waiting || total != self.claude_total;
                 if changed {
                     eprintln!("lvim-zbar: claude {} (waiting {})", prose, waiting);
                 }
                 self.claude = prose;
                 self.claude_waiting = waiting;
+                self.claude_total = total;
                 changed
             }
             // The toggle keybind (`MessagePlugin ... { name "hints_toggle"; }`).
@@ -443,6 +453,37 @@ impl State {
     /// Deliberately silent for anything that is not squarely a tab. A status bar
     /// is not a place where a stray click should do something surprising, and
     /// there is no visual feedback here to explain what it did.
+    /// A click on one of the attention fields: to the pane it is about — the agent that needs you
+    /// (or failed, or is done), in whatever session it runs; for the agents field with nothing to
+    /// go to, lvim-zclaude's board. True when the click was on a field.
+    fn click_field(&self, line: isize, col: usize) -> bool {
+        if line != 0 || self.session_edit.is_some() {
+            return false;
+        }
+        let Some((_, _, field)) = self.right_hits.iter().find(|(s, e, _)| col >= *s && col < *e) else {
+            return false;
+        };
+        let spots = self.spots.as_ref();
+        let target = spots.and_then(|s| match field {
+            Field::Agents => s.claude.first_to_visit(),
+            Field::Others => s.others.first_to_visit(),
+        });
+        match (target, field) {
+            (Some(spot), _) => {
+                eprintln!("lvim-zbar: to {:?} in {}", spot.pane, spot.session);
+                focus_session_pane(&spot.session, spot.pane);
+            }
+            (None, Field::Agents) => {
+                let session = self.mode_info.session_name.clone().unwrap_or_default();
+                pipe_message_to_plugin(
+                    MessageToPlugin::new("lvim-zclaude-open").with_payload(format!("session={session}")),
+                );
+            }
+            (None, Field::Others) => {}
+        }
+        true
+    }
+
     fn click_tab(&self, line: isize, col: usize) {
         // The bar draws a single row, so anything below it is empty space that
         // happens to belong to the pane.
@@ -574,13 +615,39 @@ impl State {
         // The agents lead the right side: a machine's load is background, but an agent waiting
         // for an answer is the one thing on this bar that is waiting for THIS person. Red is
         // that wait; otherwise the field is as quiet as CPU.
-        if !self.attention.is_empty() {
-            right.push_str(&fmt(if self.attention_urgent { red } else { teal }, bar_bg));
-            right.push_str(&format!(" {} ", self.attention));
-        }
-        if !self.claude.is_empty() {
-            right.push_str(&fmt(if self.claude_waiting { red } else { teal }, bar_bg));
-            right.push_str(&format!(" ✳ {} ", self.claude));
+        // Each part in the colour of what it says: red what waits for you or failed, yellow what
+        // runs, green what is done, teal the quiet rest. The columns of each field are kept for a
+        // click (`click_field`).
+        let tone = |t: Tone| match t {
+            Tone::Urgent => red,
+            Tone::Busy => yellow,
+            Tone::Done => green,
+            Tone::Quiet => teal,
+        };
+        let mut hits: Vec<(usize, usize, Field)> = Vec::new();
+        let agents = match self.spots.as_ref() {
+            Some(spots) => agents_parts(&spots.claude, self.claude_total),
+            // No word from zellij: lvim-zclaude's own line, as before.
+            None if !self.claude.is_empty() => vec![(
+                self.claude.clone(),
+                if self.claude_waiting { Tone::Urgent } else { Tone::Quiet },
+            )],
+            None => Vec::new(),
+        };
+        let others = self.spots.as_ref().map(|s| others_parts(&s.others)).unwrap_or_default();
+        for (field, mark, parts) in [(Field::Others, "⚙", others), (Field::Agents, "AI", agents)] {
+            if parts.is_empty() {
+                continue;
+            }
+            let start = visible_width(&right);
+            right.push_str(&fmt(teal, bar_bg));
+            right.push_str(&format!(" {mark}"));
+            for (i, (text, t)) in parts.iter().enumerate() {
+                right.push_str(&fmt(tone(*t), bar_bg));
+                right.push_str(&format!("{}{text}", if i == 0 { " " } else { " · " }));
+            }
+            right.push(' ');
+            hits.push((start, visible_width(&right), field));
         }
         if !self.cpu.is_empty() {
             // Blue while healthy, red past the warning threshold.
@@ -603,6 +670,8 @@ impl State {
 
         // ── compose on bar_bg ───────────────────────────────────────────────
         let pad = cols.saturating_sub(visible_width(&left) + visible_width(&right));
+        let right_at = visible_width(&left) + pad;
+        self.right_hits = hits.into_iter().map(|(s, e, f)| (right_at + s, right_at + e, f)).collect();
         let mut out = String::new();
         out.push_str(&fmt(bar_fg, bar_bg));
         out.push_str(&left);
@@ -1445,31 +1514,134 @@ fn visible_width(s: &str) -> usize {
     w
 }
 
-/// zellij's attention outside the agents → `● 1 · ✗ 2 · ✓ 1`, and whether any of it needs a
-/// person (needs you, failed). Muted items and Claude's own panes (`app=claude`, which the
-/// lvim-zclaude hook reports) are not counted; nothing to count is an empty field.
-fn attention_field(global: &GlobalAttention) -> (String, bool) {
-    if global.attention_disabled {
-        return (String::new(), false);
+/// One place zellij's attention tracker counts: a pane, in some session, and what it says.
+#[derive(Clone, Debug, PartialEq)]
+struct Spot {
+    status: AttentionStatus,
+    session: String,
+    /// The pane is in the session this bar is drawn in.
+    current: bool,
+    tab: String,
+    pane: PaneId,
+}
+
+/// The spots of one field, and where a click on it goes first.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct SpotList(Vec<Spot>);
+
+impl SpotList {
+    fn count(&self, status: AttentionStatus) -> usize {
+        self.0.iter().filter(|s| s.status == status).count()
     }
-    let (mut needs, mut failed, mut done) = (0, 0, 0);
-    for item in global.items.iter().filter(|i| i.is_counted()) {
-        if item.item.attention.detail.app.as_deref() == Some("claude") {
-            continue;
+
+    /// What a person most likely wants to go to: what waits for them, then what failed, then what
+    /// is done, then what still runs.
+    fn first_to_visit(&self) -> Option<&Spot> {
+        [AttentionStatus::NeedsYou, AttentionStatus::Failed, AttentionStatus::Done, AttentionStatus::Working]
+            .iter()
+            .find_map(|status| self.0.iter().find(|s| s.status == *status))
+    }
+}
+
+/// zellij's counted attention, split: the Claude agents (`app=claude`) and the rest.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Spots {
+    claude: SpotList,
+    others: SpotList,
+}
+
+impl Spots {
+    fn from_global(global: &GlobalAttention) -> Spots {
+        let mut spots = Spots::default();
+        for item in global.items.iter().filter(|i| i.is_counted()) {
+            let spot = Spot {
+                status: item.item.attention.status,
+                session: item.session.clone(),
+                current: item.is_current,
+                tab: item.item.tab_name.clone(),
+                pane: item.item.pane_id,
+            };
+            match item.item.attention.detail.app.as_deref() {
+                Some("claude") => spots.claude.0.push(spot),
+                _ => spots.others.0.push(spot),
+            }
         }
-        match item.item.attention.status {
-            AttentionStatus::NeedsYou => needs += 1,
-            AttentionStatus::Failed => failed += 1,
-            AttentionStatus::Done => done += 1,
-            _ => {}
+        spots
+    }
+}
+
+/// Which attention field a click landed on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Field {
+    Agents,
+    Others,
+}
+
+/// The colour a part of a field is drawn in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Tone {
+    Urgent,
+    Busy,
+    Done,
+    Quiet,
+}
+
+/// One agent that needs you is named by where it is — its session, or its tab when it is in this
+/// one — so the field says where to go; more than one are counted.
+fn needs_you(list: &SpotList) -> Option<(String, Tone)> {
+    let waiting: Vec<&Spot> = list.0.iter().filter(|s| s.status == AttentionStatus::NeedsYou).collect();
+    match waiting.as_slice() {
+        [] => None,
+        [one] => {
+            let place = if one.current { one.tab.clone() } else { one.session.clone() };
+            Some((format!("● {place} needs you"), Tone::Urgent))
+        }
+        many => Some((format!("● {} need you", many.len()), Tone::Urgent)),
+    }
+}
+
+/// The agents field after `AI`: `● EXAMS needs you · ◐ 1 working · ✓ 1 done · 1 idle`. Only what
+/// is not zero; `idle` is lvim-zclaude's total less the agents zellij counts for something, so
+/// every agent is in the field once. Empty without any agent.
+fn agents_parts(list: &SpotList, total: u32) -> Vec<(String, Tone)> {
+    let mut parts: Vec<(String, Tone)> = needs_you(list).into_iter().collect();
+    for (status, word, tone) in [
+        (AttentionStatus::Failed, "failed", Tone::Urgent),
+        (AttentionStatus::Working, "working", Tone::Busy),
+        (AttentionStatus::Done, "done", Tone::Done),
+    ] {
+        let n = list.count(status);
+        if n > 0 {
+            let mark = match status {
+                AttentionStatus::Failed => "✗",
+                AttentionStatus::Working => "◐",
+                _ => "✓",
+            };
+            parts.push((format!("{mark} {n} {word}"), tone));
         }
     }
-    let parts: Vec<String> = [("●", needs), ("✗", failed), ("✓", done)]
-        .iter()
-        .filter(|(_, n)| *n > 0)
-        .map(|(mark, n)| format!("{mark} {n}"))
-        .collect();
-    (parts.join(" · "), needs + failed > 0)
+    let idle = total.saturating_sub(list.0.len() as u32);
+    if idle > 0 {
+        parts.push((format!("{idle} idle"), Tone::Quiet));
+    }
+    parts
+}
+
+/// The field after `⚙`, for everything that is not an agent: `✗ 1 failed · ✓ 2 done`. Only what
+/// asks for something — a command still running (a server, a watcher) is not news, and would sit
+/// on the bar for as long as it runs.
+fn others_parts(list: &SpotList) -> Vec<(String, Tone)> {
+    let mut parts: Vec<(String, Tone)> = needs_you(list).into_iter().collect();
+    for (status, mark, word, tone) in [
+        (AttentionStatus::Failed, "✗", "failed", Tone::Urgent),
+        (AttentionStatus::Done, "✓", "done", Tone::Done),
+    ] {
+        let n = list.count(status);
+        if n > 0 {
+            parts.push((format!("{mark} {n} {word}"), tone));
+        }
+    }
+    parts
 }
 
 /// `agents=3 busy=1 waiting=1 done=0 idle=1` → the number after one of those names, or 0.
