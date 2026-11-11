@@ -96,6 +96,10 @@ struct State {
     // How many agents lvim-zclaude counts in all (`agents=N` of its summary): the field says
     // `N idle` from it when zellij has nothing counted for any of them.
     claude_total: u32,
+    // How many of all the agents lvim-zclaude sees busy (`all_busy=N`), the one in front of you
+    // too: zellij's own `working` loses an agent whose program status it has dropped (a
+    // foreground change in a pane whose shell does not mark its prompt), so the larger wins.
+    claude_busy: u32,
     // zellij's attention tracker, split in two: the Claude agents (panes whose program reports
     // `app=claude`, which lvim-zclaude's hook does) and everything else — a command that failed or
     // finished where you were not looking, a program that asks. `None` until the first
@@ -374,15 +378,24 @@ impl ZellijPlugin for State {
                 let waiting = field_count(pairs, "waiting") > 0 || field_count(pairs, "done") > 0;
                 // "0 agents" is nothing to show: the field disappears rather than reading zero.
                 let prose = if prose.starts_with("0 agent") { String::new() } else { prose };
-                let total = field_count(pairs, "agents");
-                let changed =
-                    prose != self.claude || waiting != self.claude_waiting || total != self.claude_total;
+                // `all` counts the agent in front of you too (`agents` leaves it out, for alerts);
+                // an older lvim-zclaude sends only `agents`.
+                let total = match field_count(pairs, "all") {
+                    0 => field_count(pairs, "agents"),
+                    all => all,
+                };
+                let busy = field_count(pairs, "all_busy");
+                let changed = prose != self.claude
+                    || waiting != self.claude_waiting
+                    || total != self.claude_total
+                    || busy != self.claude_busy;
                 if changed {
                     eprintln!("lvim-zbar: claude {} (waiting {})", prose, waiting);
                 }
                 self.claude = prose;
                 self.claude_waiting = waiting;
                 self.claude_total = total;
+                self.claude_busy = busy;
                 changed
             }
             // The toggle keybind (`MessagePlugin ... { name "hints_toggle"; }`).
@@ -626,7 +639,7 @@ impl State {
         };
         let mut hits: Vec<(usize, usize, Field)> = Vec::new();
         let agents = match self.spots.as_ref() {
-            Some(spots) => agents_parts(&spots.claude, self.claude_total),
+            Some(spots) => agents_parts(&spots.claude, self.claude_total, self.claude_busy),
             // No word from zellij: lvim-zclaude's own line, as before.
             None if !self.claude.is_empty() => vec![(
                 self.claude.clone(),
@@ -642,9 +655,9 @@ impl State {
             let start = visible_width(&right);
             right.push_str(&fmt(teal, bar_bg));
             right.push_str(&format!(" {mark}"));
-            for (i, (text, t)) in parts.iter().enumerate() {
+            for (text, t) in &parts {
                 right.push_str(&fmt(tone(*t), bar_bg));
-                right.push_str(&format!("{}{text}", if i == 0 { " " } else { " · " }));
+                right.push_str(&format!(" {text}"));
             }
             right.push(' ');
             hits.push((start, visible_width(&right), field));
@@ -1600,17 +1613,25 @@ fn needs_you(list: &SpotList) -> Option<(String, Tone)> {
     }
 }
 
-/// The agents field after `AI`: `● EXAMS needs you · ◐ 1 working · ✓ 1 done · 1 idle`. Only what
-/// is not zero; `idle` is lvim-zclaude's total less the agents zellij counts for something, so
-/// every agent is in the field once. Empty without any agent.
-fn agents_parts(list: &SpotList, total: u32) -> Vec<(String, Tone)> {
+/// The agents field after `AI`: `● EXAMS needs you ◐ 1 working ✓ 1 done ○ 1 idle`. Only what
+/// is not zero. What waits for you, failed or is done comes from zellij (it leaves out the pane in
+/// front of you — that is not news); `working` is the larger of zellij's count and lvim-zclaude's
+/// `busy` (every agent, the one in front of you too); `idle` is the rest of lvim-zclaude's total,
+/// so every agent is in the field once. Empty without any agent.
+fn agents_parts(list: &SpotList, total: u32, busy: u32) -> Vec<(String, Tone)> {
     let mut parts: Vec<(String, Tone)> = needs_you(list).into_iter().collect();
+    let working = (list.count(AttentionStatus::Working) as u32).max(busy);
+    let mut shown = list.count(AttentionStatus::NeedsYou) as u32;
     for (status, word, tone) in [
         (AttentionStatus::Failed, "failed", Tone::Urgent),
         (AttentionStatus::Working, "working", Tone::Busy),
         (AttentionStatus::Done, "done", Tone::Done),
     ] {
-        let n = list.count(status);
+        let n = match status {
+            AttentionStatus::Working => working as usize,
+            _ => list.count(status),
+        };
+        shown += n as u32;
         if n > 0 {
             let mark = match status {
                 AttentionStatus::Failed => "✗",
@@ -1620,14 +1641,14 @@ fn agents_parts(list: &SpotList, total: u32) -> Vec<(String, Tone)> {
             parts.push((format!("{mark} {n} {word}"), tone));
         }
     }
-    let idle = total.saturating_sub(list.0.len() as u32);
+    let idle = total.saturating_sub(shown);
     if idle > 0 {
-        parts.push((format!("{idle} idle"), Tone::Quiet));
+        parts.push((format!("○ {idle} idle"), Tone::Quiet));
     }
     parts
 }
 
-/// The field after `⚙`, for everything that is not an agent: `✗ 1 failed · ✓ 2 done`. Only what
+/// The field after `⚙`, for everything that is not an agent: `✗ 1 failed ✓ 2 done`. Only what
 /// asks for something — a command still running (a server, a watcher) is not news, and would sit
 /// on the bar for as long as it runs.
 fn others_parts(list: &SpotList) -> Vec<(String, Tone)> {

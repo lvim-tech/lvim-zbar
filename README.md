@@ -198,12 +198,12 @@ In front of them, when there is something to say, two fields from zellij's atten
 (`GlobalAttentionUpdate`, all sessions; zellij `main` at or after `644d78c`):
 
 ```
-⚙ ✗ 1 failed · ✓ 1 done   AI ● EXAMS needs you · ◐ 1 working · 1 idle
+⚙ ✗ 1 failed ✓ 1 done   AI ● EXAMS needs you ◐ 1 working ○ 1 idle
 ```
 
 - **`AI` the Claude agents** — the panes whose program reports `app=claude` (lvim-zclaude's hook
   does): `● … needs you` (named by its session, or its tab in this one, when it is the only one;
-  counted when more), `✗ failed`, `◐ working`, `✓ done`, and `N idle` for the rest of the agents
+  counted when more), `✗ failed`, `◐ working`, `✓ done`, and `○ N idle` for the rest of the agents
   lvim-zclaude counts. Without a word from zellij it falls back to lvim-zclaude's own line.
 - **`⚙` everything else** that asks for something: a program that needs you, a command that failed
   or finished in a pane you were not looking at (`✗` / `✓`). zellij knows a shell command only if
